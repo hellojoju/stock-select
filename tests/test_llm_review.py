@@ -146,3 +146,39 @@ class TestLLMReview:
 
         os.environ.clear()
         os.environ.update(env)
+
+
+class TestLLMReviewExtensions:
+    def test_build_stock_review_packet(self):
+        from stock_select.llm_prompt import build_stock_review_packet
+        packet = build_stock_review_packet(
+            stock_code="000001.SZ",
+            trading_date="2026-01-12",
+            decisions=[{"decision_id": "d1", "action": "BUY", "score": 0.7}],
+            evidence=[],
+            blindspots=[],
+        )
+        assert packet["target"]["type"] == "stock"
+        assert packet["target"]["id"] == "000001.SZ"
+        assert len(packet["decisions"]) == 1
+
+    def test_build_blindspot_review_packet(self):
+        from stock_select.llm_prompt import build_blindspot_review_packet
+        packet = build_blindspot_review_packet(
+            stock_code="000002.SZ",
+            trading_date="2026-01-12",
+            candidate_packet={},
+            missed_events=[{"event": "test"}],
+        )
+        assert packet["target"]["type"] == "blindspot"
+        assert "known_error_taxonomy" in packet
+
+    def test_contract_rejects_invalid_target_type(self):
+        from stock_select.llm_contracts import LLMReviewContract, LLMContractError
+        with pytest.raises(LLMContractError, match="review target type"):
+            LLMReviewContract.validate({
+                "review_target": {"type": "invalid_type", "id": "x"},
+                "attribution": [],
+                "reason_check": {},
+                "summary": "",
+            })

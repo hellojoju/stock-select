@@ -15,6 +15,13 @@ KNOWN_ERROR_TAXONOMY = [
     "entry_unfillable",
 ]
 
+STOCK_KNOWN_ERROR_TAXONOMY = KNOWN_ERROR_TAXONOMY + [
+    "catalyst_missed",
+    "industry_rotation",
+    "liquidity_crisis",
+    "valuation_extreme",
+]
+
 
 def build_decision_review_packet(
     decision_row: dict,
@@ -76,3 +83,38 @@ def build_user_prompt(packet: dict[str, Any]) -> str:
         f"4. Any missing signals\n"
         f"5. Suggested parameter adjustments"
     )
+
+
+def build_stock_review_packet(
+    stock_code: str,
+    trading_date: str,
+    decisions: list[dict],
+    evidence: list[dict],
+    blindspots: list[dict],
+) -> dict[str, Any]:
+    """Build packet for per-stock LLM review."""
+    return {
+        "target": {"type": "stock", "id": stock_code, "date": trading_date},
+        "decisions": [
+            {"decision_id": d.get("decision_id"), "action": d.get("action"), "score": d.get("score")}
+            for d in decisions
+        ],
+        "evidence": evidence,
+        "blindspots": blindspots,
+        "known_error_taxonomy": KNOWN_ERROR_TAXONOMY,
+    }
+
+
+def build_blindspot_review_packet(
+    stock_code: str,
+    trading_date: str,
+    candidate_packet: dict,
+    missed_events: list[dict],
+) -> dict[str, Any]:
+    """Build packet for blindspot LLM review."""
+    return {
+        "target": {"type": "blindspot", "id": stock_code, "date": trading_date},
+        "candidate_packet": candidate_packet,
+        "missed_events": missed_events,
+        "known_error_taxonomy": KNOWN_ERROR_TAXONOMY,
+    }

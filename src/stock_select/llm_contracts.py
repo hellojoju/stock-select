@@ -50,6 +50,11 @@ class LLMReviewContract:
         _require(target, "type", "review_target")
         _require(target, "id", "review_target")
 
+        VALID_TARGET_TYPES = {"decision", "stock", "blindspot", "system"}
+        target_type = target.get("type", "")
+        if target_type not in VALID_TARGET_TYPES:
+            raise LLMContractError(f"Invalid review target type: {target_type}")
+
         attribution = [
             AttributionClaim.validate(item)
             for item in _require(payload, "attribution", "root")
