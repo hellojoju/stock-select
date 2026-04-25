@@ -302,7 +302,8 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
                 (signal_id,),
             )
             conn.commit()
-            if conn.total_changes == 0:
+            affected = conn.execute("SELECT changes()").fetchone()[0]
+            if affected == 0:
                 return {"status": "not_found_or_not_candidate"}
             return {"status": "accepted"}
         finally:
@@ -317,6 +318,9 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
                 (signal_id,),
             )
             conn.commit()
+            affected = conn.execute("SELECT changes()").fetchone()[0]
+            if affected == 0:
+                return {"status": "not_found_or_not_candidate"}
             return {"status": "rejected"}
         finally:
             conn.close()

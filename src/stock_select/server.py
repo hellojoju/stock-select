@@ -11,13 +11,14 @@ from .db import connect, init_db
 from .blindspot_review import run_blindspot_review
 from .data_status import data_quality_rows, data_quality_summary, data_source_status
 from .deterministic_review import review_decision
-from .evolution import promote_challenger, propose_strategy_evolution, rollback_evolution
+from .evolution import evolution_comparison, promote_challenger, propose_strategy_evolution, rollback_evolution
+from .evidence_views import evidence_status as evidence_status_payload, stock_evidence
 from .factor_views import factor_status, sector_factors, stock_factors
 from .gene_review import get_preopen_strategy_review, list_preopen_strategy_reviews, review_gene
 from .graph import query_graph
 from .memory import search_memory
 from .optimization_signals import list_optimization_signals
-from .repository import latest_trading_date, rows_to_dicts
+from .repository import latest_trading_date, review_rows_for_date, rows_to_dicts
 from .review_packets import stock_review, stock_review_history
 from .runtime import resolve_runtime
 from .simulator import summarize_performance
@@ -58,6 +59,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.respond_json(self.genes())
             elif parsed.path == "/api/evolution/events":
                 self.respond_json(self.evolution_events(params))
+            elif parsed.path == "/api/evolution/comparison":
+                self.respond_json(self.evolution_comparison(params))
             elif parsed.path.startswith("/api/genes/") and parsed.path.endswith("/performance"):
                 gene_id = parsed.path.split("/")[3]
                 self.respond_json(self.gene_performance(gene_id))
@@ -74,6 +77,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.respond_json(self.stock_factors(stock_code, params))
             elif parsed.path == "/api/factors/sectors":
                 self.respond_json(self.sector_factors(params))
+            elif parsed.path == "/api/evidence/status":
+                self.respond_json(self.evidence_status(params))
+            elif parsed.path.startswith("/api/evidence/stocks/"):
+                stock_code = parsed.path.split("/")[4]
+                self.respond_json(self.stock_evidence(stock_code, params))
             elif parsed.path.startswith("/api/reviews/stocks/") and parsed.path.endswith("/history"):
                 stock_code = parsed.path.split("/")[4]
                 self.respond_json(self.stock_review_history(stock_code, params))
@@ -87,6 +95,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.respond_json(self.preopen_strategy_review(gene_id, params))
             elif parsed.path == "/api/reviews":
                 self.respond_json(self.reviews(params["date"]))
+            elif parsed.path == "/api/reviews/llm":
+                self.respond_json(self.llm_reviews(params["date"]))
             elif parsed.path == "/api/optimization-signals":
                 self.respond_json(self.optimization_signals(params))
             elif parsed.path == "/api/memory/search":
@@ -120,6 +130,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/api/reviews/stocks/") and parsed.path.endswith("/rerun"):
                 stock_code = parsed.path.split("/")[4]
                 self.respond_json(self.rerun_stock_review(stock_code, params))
+            elif parsed.path.startswith("/api/optimization-signals/") and parsed.path.endswith("/accept"):
+                signal_id = parsed.path.split("/")[4]
+                self.respond_json(self.accept_signal(signal_id))
+            elif parsed.path.startswith("/api/optimization-signals/") and parsed.path.endswith("/reject"):
+                signal_id = parsed.path.split("/")[4]
+                self.respond_json(self.reject_signal(signal_id))
+            elif parsed.path == "/api/reviews/llm/rerun":
+                self.respond_json(self.rerun_llm_review(params["date"]))
             elif parsed.path.startswith("/api/reviews/preopen-strategies/") and parsed.path.endswith("/rerun"):
                 gene_id = parsed.path.split("/")[4]
                 self.respond_json(self.rerun_preopen_strategy_review(gene_id, params))
@@ -142,6 +160,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self.runtime_context.as_payload() | {"date": None, "picks": [], "performance": [], "runs": [], "data_quality": []}
             quality_summary = data_quality_summary(conn, current_date)
             market = quality_summary.get("market_environment") or {}
+            evidence_summary = evidence_status_payload(conn, current_date)
             return self.runtime_context.as_payload() | {
                 "date": current_date,
                 "market_environment": market.get("market_environment") if isinstance(market, dict) else None,
@@ -165,6 +184,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ),
                 "data_status": data_source_status(conn, current_date),
                 "data_quality_summary": quality_summary,
+                "evidence_status": evidence_summary,
                 "candidate_scores": rows_to_dicts(
                     conn.execute(
                         """
@@ -218,6 +238,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         conn = self.db()
         try:
             return sector_factors(conn, params["date"])
+        finally:
+            conn.close()
+
+    def evidence_status(self, params: dict[str, str]):
+        conn = self.db()
+        try:
+            return evidence_status_payload(conn, params["date"])
+        finally:
+            conn.close()
+
+    def stock_evidence(self, stock_code: str, params: dict[str, str]):
+        conn = self.db()
+        try:
+            return stock_evidence(conn, stock_code, params["date"])
         finally:
             conn.close()
 
@@ -285,6 +319,36 @@ class ApiHandler(BaseHTTPRequestHandler):
                 status=params.get("status"),
                 limit=int(params.get("limit", "200")),
             )
+        finally:
+            conn.close()
+
+    def accept_signal(self, signal_id: str):
+        conn = self.db()
+        try:
+            conn.execute(
+                "UPDATE optimization_signals SET status = 'open' WHERE signal_id = ? AND status = 'candidate'",
+                (signal_id,),
+            )
+            conn.commit()
+            affected = conn.execute("SELECT changes()").fetchone()[0]
+            if affected == 0:
+                return {"status": "not_found_or_not_candidate"}
+            return {"status": "accepted"}
+        finally:
+            conn.close()
+
+    def reject_signal(self, signal_id: str):
+        conn = self.db()
+        try:
+            conn.execute(
+                "UPDATE optimization_signals SET status = 'rejected' WHERE signal_id = ? AND status = 'candidate'",
+                (signal_id,),
+            )
+            conn.commit()
+            affected = conn.execute("SELECT changes()").fetchone()[0]
+            if affected == 0:
+                return {"status": "not_found_or_not_candidate"}
+            return {"status": "rejected"}
         finally:
             conn.close()
 
@@ -386,6 +450,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                 min_signal_samples=int(params.get("min_signal_samples", "5")),
                 min_signal_confidence=float(params.get("min_signal_confidence", "0.65")),
                 min_signal_dates=int(params.get("min_signal_dates", "3")),
+                dry_run=parse_bool(params.get("dry_run")),
+            )
+        finally:
+            conn.close()
+
+    def evolution_comparison(self, params: dict[str, str]):
+        conn = self.db()
+        try:
+            return evolution_comparison(
+                conn,
+                gene_id=params.get("gene_id"),
+                start=params.get("start"),
+                end=params.get("end"),
             )
         finally:
             conn.close()
@@ -432,7 +509,46 @@ class ApiHandler(BaseHTTPRequestHandler):
     def reviews(self, date: str):
         conn = self.db()
         try:
-            return rows_to_dicts(conn.execute("SELECT * FROM review_logs WHERE trading_date = ?", (date,)))
+            return review_rows_for_date(conn, date)
+        finally:
+            conn.close()
+
+    def llm_reviews(self, date: str):
+        conn = self.db()
+        try:
+            rows = conn.execute(
+                """SELECT l.*, s.prompt_tokens, s.completion_tokens, s.estimated_cost
+                   FROM llm_reviews l
+                   LEFT JOIN llm_scratchpad s ON l.llm_review_id = s.llm_review_id
+                   WHERE l.trading_date = ?
+                   ORDER BY l.created_at DESC""",
+                (date,),
+            ).fetchall()
+            result = []
+            for r in rows:
+                d = dict(r)
+                d["attribution"] = json.loads(d.pop("attribution_json", "[]"))
+                d["reason_check"] = json.loads(d.pop("reason_check_json", "{}"))
+                d["suggested_signals"] = json.loads(d.pop("suggested_signals_json", "[]"))
+                if d.get("prompt_tokens") is not None:
+                    d["token_usage"] = {
+                        "prompt_tokens": d.pop("prompt_tokens"),
+                        "completion_tokens": d.pop("completion_tokens"),
+                        "estimated_cost": d.pop("estimated_cost"),
+                    }
+                else:
+                    for k in ("prompt_tokens", "completion_tokens", "estimated_cost"):
+                        d.pop(k, None)
+                result.append(d)
+            return result
+        finally:
+            conn.close()
+
+    def rerun_llm_review(self, date: str):
+        conn = self.db()
+        try:
+            from .llm_review import run_llm_review
+            return run_llm_review(conn, date)
         finally:
             conn.close()
 
