@@ -498,6 +498,48 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
         finally:
             conn.close()
 
+    @app.get("/api/reviews/llm")
+    def list_llm_reviews(date: str) -> list[dict[str, Any]]:
+        conn = db()
+        try:
+            rows = conn.execute(
+                """SELECT l.*, s.prompt_tokens, s.completion_tokens, s.estimated_cost
+                   FROM llm_reviews l
+                   LEFT JOIN llm_scratchpad s ON l.llm_review_id = s.llm_review_id
+                   WHERE l.trading_date = ?
+                   ORDER BY l.created_at DESC""",
+                (date,),
+            ).fetchall()
+            result = []
+            for r in rows:
+                d = dict(r)
+                d["attribution"] = json.loads(d.pop("attribution_json", "[]"))
+                d["reason_check"] = json.loads(d.pop("reason_check_json", "{}"))
+                d["suggested_signals"] = json.loads(d.pop("suggested_signals_json", "[]"))
+                if d.get("prompt_tokens") is not None:
+                    d["token_usage"] = {
+                        "prompt_tokens": d.pop("prompt_tokens"),
+                        "completion_tokens": d.pop("completion_tokens"),
+                        "estimated_cost": d.pop("estimated_cost"),
+                    }
+                else:
+                    d.pop("prompt_tokens", None)
+                    d.pop("completion_tokens", None)
+                    d.pop("estimated_cost", None)
+                result.append(d)
+            return result
+        finally:
+            conn.close()
+
+    @app.post("/api/reviews/llm/rerun")
+    def rerun_llm_review(date: str) -> dict[str, Any]:
+        conn = db()
+        try:
+            from .llm_review import run_llm_review
+            return run_llm_review(conn, date)
+        finally:
+            conn.close()
+
     @app.get("/api/memory/search")
     def memory_search(q: str, limit: int = 10) -> list[dict[str, Any]]:
         conn = db()
