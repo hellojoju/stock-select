@@ -417,6 +417,21 @@ def init_db(conn: sqlite3.Connection) -> None:
           UNIQUE(review_scope, review_id, error_type)
         );
 
+        CREATE TABLE IF NOT EXISTS llm_reviews (
+          llm_review_id TEXT PRIMARY KEY,
+          decision_review_id TEXT NOT NULL REFERENCES decision_reviews(review_id),
+          trading_date TEXT NOT NULL,
+          strategy_gene_id TEXT NOT NULL,
+          attribution_json TEXT NOT NULL,
+          reason_check_json TEXT NOT NULL,
+          suggested_errors_json TEXT NOT NULL,
+          suggested_signals_json TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'candidate',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(decision_review_id)
+        );
+
         CREATE TABLE IF NOT EXISTS news_items (
           news_id TEXT PRIMARY KEY,
           source TEXT NOT NULL,
