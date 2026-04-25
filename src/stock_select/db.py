@@ -432,6 +432,22 @@ def init_db(conn: sqlite3.Connection) -> None:
           UNIQUE(decision_review_id)
         );
 
+        CREATE TABLE IF NOT EXISTS llm_scratchpad (
+          scratchpad_id TEXT PRIMARY KEY,
+          llm_review_id TEXT REFERENCES llm_reviews(llm_review_id),
+          decision_review_id TEXT,
+          packet_hash TEXT,
+          model TEXT,
+          provider TEXT,
+          prompt_tokens INTEGER DEFAULT 0,
+          completion_tokens INTEGER DEFAULT 0,
+          estimated_cost REAL DEFAULT 0.0,
+          latency_ms INTEGER DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'ok',
+          error_message TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS news_items (
           news_id TEXT PRIMARY KEY,
           source TEXT NOT NULL,
@@ -673,6 +689,82 @@ def _ensure_live_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "source_daily_prices", "is_limit_up", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "source_daily_prices", "is_limit_down", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "data_sources", "source_reliability", "TEXT NOT NULL DEFAULT 'medium'")
+    _ensure_evidence_schema(conn)
+
+
+def _ensure_evidence_schema(conn: sqlite3.Connection) -> None:
+    ensure_column(conn, "analyst_expectations", "source_fetched_at", "TEXT")
+    ensure_column(conn, "analyst_expectations", "confidence", "REAL NOT NULL DEFAULT 1.0")
+    ensure_column(conn, "analyst_expectations", "raw_json", "TEXT NOT NULL DEFAULT '{}'")
+
+    ensure_column(conn, "financial_actuals", "actual_id", "TEXT")
+    ensure_column(conn, "financial_actuals", "publish_date", "TEXT")
+    ensure_column(conn, "financial_actuals", "as_of_date", "TEXT")
+    ensure_column(conn, "financial_actuals", "deducted_net_profit", "REAL")
+    ensure_column(conn, "financial_actuals", "debt_to_assets", "REAL")
+    ensure_column(conn, "financial_actuals", "source_fetched_at", "TEXT")
+    ensure_column(conn, "financial_actuals", "confidence", "REAL NOT NULL DEFAULT 1.0")
+    ensure_column(conn, "financial_actuals", "raw_json", "TEXT NOT NULL DEFAULT '{}'")
+
+    ensure_column(conn, "earnings_surprises", "actual_id", "TEXT")
+    ensure_column(conn, "earnings_surprises", "expectation_snapshot_id", "TEXT")
+    ensure_column(conn, "earnings_surprises", "surprise_amount", "REAL")
+    ensure_column(conn, "earnings_surprises", "surprise_pct", "REAL")
+    ensure_column(conn, "earnings_surprises", "surprise_type", "TEXT")
+    ensure_column(conn, "earnings_surprises", "as_of_date", "TEXT")
+    ensure_column(conn, "earnings_surprises", "evidence_level", "TEXT NOT NULL DEFAULT 'INFERRED'")
+    ensure_column(conn, "earnings_surprises", "confidence", "REAL NOT NULL DEFAULT 1.0")
+    ensure_column(conn, "earnings_surprises", "raw_json", "TEXT NOT NULL DEFAULT '{}'")
+
+    ensure_column(conn, "order_contract_events", "publish_date", "TEXT")
+    ensure_column(conn, "order_contract_events", "as_of_date", "TEXT")
+    ensure_column(conn, "order_contract_events", "title", "TEXT")
+    ensure_column(conn, "order_contract_events", "summary", "TEXT")
+    ensure_column(conn, "order_contract_events", "contract_amount_pct_revenue", "REAL")
+    ensure_column(conn, "order_contract_events", "counterparty", "TEXT")
+    ensure_column(conn, "order_contract_events", "duration", "TEXT")
+    ensure_column(conn, "order_contract_events", "impact_score", "REAL NOT NULL DEFAULT 0")
+    ensure_column(conn, "order_contract_events", "source_fetched_at", "TEXT")
+    ensure_column(conn, "order_contract_events", "raw_json", "TEXT NOT NULL DEFAULT '{}'")
+
+    ensure_column(conn, "business_kpi_actuals", "report_period", "TEXT")
+    ensure_column(conn, "business_kpi_actuals", "publish_date", "TEXT")
+    ensure_column(conn, "business_kpi_actuals", "as_of_date", "TEXT")
+    ensure_column(conn, "business_kpi_actuals", "kpi_unit", "TEXT")
+    ensure_column(conn, "business_kpi_actuals", "kpi_yoy", "REAL")
+    ensure_column(conn, "business_kpi_actuals", "kpi_qoq", "REAL")
+    ensure_column(conn, "business_kpi_actuals", "industry", "TEXT")
+    ensure_column(conn, "business_kpi_actuals", "source_fetched_at", "TEXT")
+    ensure_column(conn, "business_kpi_actuals", "raw_json", "TEXT NOT NULL DEFAULT '{}'")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS risk_events (
+          risk_event_id TEXT PRIMARY KEY,
+          stock_code TEXT NOT NULL REFERENCES stocks(stock_code),
+          event_date TEXT NOT NULL,
+          publish_date TEXT NOT NULL,
+          as_of_date TEXT NOT NULL,
+          risk_type TEXT NOT NULL,
+          severity TEXT NOT NULL DEFAULT 'medium',
+          title TEXT NOT NULL,
+          summary TEXT,
+          impact_score REAL NOT NULL DEFAULT 0,
+          source TEXT NOT NULL,
+          source_url TEXT,
+          source_fetched_at TEXT,
+          confidence REAL NOT NULL DEFAULT 1.0,
+          raw_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_financial_actuals_asof ON financial_actuals(stock_code, as_of_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_analyst_expectations_date ON analyst_expectations(stock_code, report_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_earnings_surprises_asof ON earnings_surprises(stock_code, as_of_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_order_contract_asof ON order_contract_events(stock_code, as_of_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_business_kpi_asof ON business_kpi_actuals(stock_code, as_of_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_risk_events_asof ON risk_events(stock_code, as_of_date)")
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
