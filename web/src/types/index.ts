@@ -90,3 +90,71 @@ export type LLMReview = {
     estimated_cost: number;
   };
 };
+
+/* === Stock Review Detail === */
+
+export type FactorItem = {
+  factor_type: string;
+  verdict: string;
+  contribution_score: number;
+  error_type: string | null;
+  confidence: string;
+  evidence_ids: string[];
+};
+
+export type ReviewError = {
+  error_type: string;
+  severity: number;
+  confidence: number;
+  evidence_ids: string[];
+};
+
+export type ReviewEvidence = {
+  evidence_id: string;
+  source_type: string;
+  visibility: string;
+  confidence: string;
+  payload_json: string;
+};
+
+export type ReviewSignal = {
+  signal_id: string;
+  signal_type: string;
+  param_name: string;
+  direction: string;
+  strength: number;
+  status: string;
+  reason: string;
+};
+
+export type AnalystReview = {
+  analyst_review_id: string;
+  decision_id: string;
+  trading_date: string;
+  stock_code: string;
+  stock_name?: string;
+  strategy_gene_id: string;
+  analyst_key: string;
+  display_name?: string;
+  verdict: string;
+  confidence: number;
+  reasoning: string[];
+  suggested_errors: string[];
+};
+
+export type ReviewDecision = {
+  review_id: string;
+  decision_id: string;
+  strategy_gene_id: string;
+  stock_code: string;
+  verdict: string;
+  primary_driver: string;
+  return_pct: number;
+  relative_return_pct: number;
+  summary: string;
+  factor_items: FactorItem[];
+  errors: ReviewError[];
+  evidence: ReviewEvidence[];
+  optimization_signals: ReviewSignal[];
+  llm_json?: string;
+};

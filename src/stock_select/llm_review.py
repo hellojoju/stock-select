@@ -296,7 +296,7 @@ def get_llm_client(config: LLMConfig):
             logger.warning("anthropic package not installed, skipping LLM review")
             return None
 
-        client = anthropic.Anthropic(api_key=config.api_key)
+        client = anthropic.Anthropic(api_key=config.api_key, base_url=config.base_url)
 
         def _call(prompt: str, system: str) -> dict | None:
             resp = client.messages.create(

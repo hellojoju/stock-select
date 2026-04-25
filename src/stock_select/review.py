@@ -10,6 +10,7 @@ from .contracts import ReviewContract
 from .deterministic_review import run_deterministic_review
 from .gene_review import run_gene_reviews_for_date
 from .memory import add_memory
+from .review_analysts import run_analyst_reviews
 from .system_review import run_system_review
 
 
@@ -69,6 +70,7 @@ def generate_deterministic_reviews(conn: sqlite3.Connection, trading_date: str) 
     run_blindspot_review(conn, trading_date)
     run_gene_reviews_for_date(conn, trading_date)
     run_system_review(conn, trading_date)
+    run_analyst_reviews(conn, trading_date)
     return review_ids
 
 

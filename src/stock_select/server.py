@@ -16,17 +16,19 @@ from .evidence_views import evidence_status as evidence_status_payload, stock_ev
 from .factor_views import factor_status, sector_factors, stock_factors
 from .gene_review import get_preopen_strategy_review, list_preopen_strategy_reviews, review_gene
 from .graph import query_graph
+from .llm_config import DEEPSEEK_MODELS, get_model_override, resolve_llm_config, set_model_override
 from .memory import search_memory
 from .optimization_signals import list_optimization_signals
 from .repository import latest_trading_date, review_rows_for_date, rows_to_dicts
 from .review_packets import stock_review, stock_review_history
+from .review_analysts import get_analyst_reviews_for_date
 from .runtime import resolve_runtime
 from .simulator import summarize_performance
 from .strategies import seed_default_genes
 from .system_review import review_summary
 
 
-def run_server(host: str = "127.0.0.1", port: int = 8000, db_path: str | Path | None = None, mode: str = "demo") -> None:
+def run_server(host: str = "127.0.0.1", port: int = 18425, db_path: str | Path | None = None, mode: str = "demo") -> None:
     runtime = resolve_runtime(mode, db_path)
 
     class Handler(ApiHandler):
@@ -53,6 +55,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/dashboard":
                 self.respond_json(self.dashboard(params.get("date")))
+            elif parsed.path == "/api/config":
+                self.respond_json(self.get_config())
             elif parsed.path == "/api/picks":
                 self.respond_json(self.picks(params))
             elif parsed.path == "/api/genes":
@@ -97,6 +101,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.respond_json(self.reviews(params["date"]))
             elif parsed.path == "/api/reviews/llm":
                 self.respond_json(self.llm_reviews(params["date"]))
+            elif parsed.path == "/api/reviews/analysts":
+                self.respond_json(self.analyst_reviews(params["date"]))
             elif parsed.path == "/api/optimization-signals":
                 self.respond_json(self.optimization_signals(params))
             elif parsed.path == "/api/memory/search":
@@ -119,6 +125,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/runs/"):
                 phase = parsed.path.split("/")[-1]
                 self.respond_json(self.trigger_run(phase, params["date"]))
+            elif parsed.path == "/api/config/model":
+                self.respond_json(self.set_config_model(self.read_body()))
             elif parsed.path == "/api/evolution/propose":
                 self.respond_json(self.propose_evolution(params))
             elif parsed.path == "/api/evolution/rollback":
@@ -513,6 +521,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def analyst_reviews(self, date: str):
+        conn = self.db()
+        try:
+            return get_analyst_reviews_for_date(conn, date)
+        finally:
+            conn.close()
+
     def llm_reviews(self, date: str):
         conn = self.db()
         try:
@@ -572,6 +587,40 @@ class ApiHandler(BaseHTTPRequestHandler):
             return query_graph(conn, params.get("node_type"), int(params.get("limit", "100")))
         finally:
             conn.close()
+
+    def get_config(self) -> dict:
+        config = resolve_llm_config()
+        if not config:
+            return {"provider": None, "model": None, "available_models": []}
+        models = [
+            {"key": k, "model": v["model"], "label": v["label"]}
+            for k, v in DEEPSEEK_MODELS.items()
+        ] if config.provider == "deepseek" else [
+            {"key": config.model, "model": config.model, "label": config.model}
+        ]
+        return {
+            "provider": config.provider,
+            "model": config.model,
+            "override": get_model_override(),
+            "available_models": models,
+        }
+
+    def set_config_model(self, body: str) -> dict:
+        try:
+            data = json.loads(body)
+            model = data.get("model", "")
+        except (json.JSONDecodeError, TypeError):
+            return {"error": "invalid JSON"}
+        if not model:
+            return {"error": "model required"}
+        set_model_override(model)
+        return {"status": "ok", "model": model}
+
+    def read_body(self) -> str:
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 0:
+            return self.rfile.read(length).decode("utf-8")
+        return "{}"
 
     def respond_json(self, payload, status: int = 200) -> None:
         encoded = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")

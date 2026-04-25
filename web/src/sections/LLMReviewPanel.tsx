@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { LLMReview } from '../types';
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000';
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:18425';
 
 export default function LLMReviewPanel({ reviews }: { reviews: LLMReview[] }) {
   const [expanded, setExpanded] = useState<string | null>(null);

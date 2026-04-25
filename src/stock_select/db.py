@@ -448,6 +448,21 @@ def init_db(conn: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS analyst_reviews (
+          analyst_review_id TEXT PRIMARY KEY,
+          decision_id TEXT NOT NULL,
+          trading_date TEXT NOT NULL,
+          stock_code TEXT NOT NULL,
+          strategy_gene_id TEXT NOT NULL,
+          analyst_key TEXT NOT NULL,
+          verdict TEXT NOT NULL,
+          confidence REAL NOT NULL,
+          reasoning TEXT NOT NULL,
+          suggested_errors TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(decision_id, analyst_key)
+        );
+
         CREATE TABLE IF NOT EXISTS news_items (
           news_id TEXT PRIMARY KEY,
           source TEXT NOT NULL,

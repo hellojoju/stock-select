@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import hashlib
 from collections.abc import Iterable
 from typing import Any
+
+from .review_taxonomy import EVIDENCE_CONFIDENCE, RISK_TYPES, SURPRISE_TYPES, assert_member
 
 
 def dumps(value: object) -> str:
@@ -738,6 +741,597 @@ def latest_trading_date(conn: sqlite3.Connection) -> str | None:
 
 def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
+
+
+def stable_id(prefix: str, *parts: object) -> str:
+    text = ":".join("" if part is None else str(part) for part in parts)
+    return f"{prefix}_" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def upsert_financial_actual(
+    conn: sqlite3.Connection,
+    *,
+    stock_code: str,
+    report_period: str,
+    publish_date: str,
+    as_of_date: str,
+    revenue: float | None = None,
+    net_profit: float | None = None,
+    deducted_net_profit: float | None = None,
+    eps: float | None = None,
+    roe: float | None = None,
+    gross_margin: float | None = None,
+    operating_cashflow: float | None = None,
+    debt_to_assets: float | None = None,
+    source: str,
+    source_url: str | None = None,
+    source_fetched_at: str | None = None,
+    confidence: float = 1.0,
+    raw_json: dict[str, Any] | str | None = None,
+    actual_id: str | None = None,
+) -> str:
+    actual_id = actual_id or stable_id("fact", stock_code, report_period, source)
+    raw = raw_json if isinstance(raw_json, str) else dumps(raw_json or {})
+    conn.execute(
+        """
+        INSERT INTO financial_actuals(
+          stock_code, report_period, ann_date, revenue, net_profit,
+          net_profit_deducted, eps, roe, gross_margin, operating_cashflow,
+          source, source_url, actual_id, publish_date, as_of_date,
+          deducted_net_profit, debt_to_assets, source_fetched_at, confidence, raw_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(stock_code, report_period, source) DO UPDATE SET
+          ann_date = excluded.ann_date,
+          revenue = excluded.revenue,
+          net_profit = excluded.net_profit,
+          net_profit_deducted = excluded.net_profit_deducted,
+          eps = excluded.eps,
+          roe = excluded.roe,
+          gross_margin = excluded.gross_margin,
+          operating_cashflow = excluded.operating_cashflow,
+          source_url = excluded.source_url,
+          actual_id = excluded.actual_id,
+          publish_date = excluded.publish_date,
+          as_of_date = excluded.as_of_date,
+          deducted_net_profit = excluded.deducted_net_profit,
+          debt_to_assets = excluded.debt_to_assets,
+          source_fetched_at = excluded.source_fetched_at,
+          confidence = excluded.confidence,
+          raw_json = excluded.raw_json
+        """,
+        (
+            stock_code,
+            report_period,
+            publish_date,
+            revenue,
+            net_profit,
+            deducted_net_profit,
+            eps,
+            roe,
+            gross_margin,
+            operating_cashflow,
+            source,
+            source_url,
+            actual_id,
+            publish_date,
+            as_of_date,
+            deducted_net_profit,
+            debt_to_assets,
+            source_fetched_at,
+            confidence,
+            raw,
+        ),
+    )
+    return actual_id
+
+
+def upsert_analyst_expectation(
+    conn: sqlite3.Connection,
+    *,
+    stock_code: str,
+    report_date: str,
+    forecast_period: str,
+    source: str,
+    org_name: str | None = None,
+    author_name: str | None = None,
+    report_title: str | None = None,
+    forecast_revenue: float | None = None,
+    forecast_net_profit: float | None = None,
+    forecast_eps: float | None = None,
+    forecast_pe: float | None = None,
+    rating: str | None = None,
+    target_price_min: float | None = None,
+    target_price_max: float | None = None,
+    source_url: str | None = None,
+    source_fetched_at: str | None = None,
+    confidence: float = 1.0,
+    raw_json: dict[str, Any] | str | None = None,
+    expectation_id: str | None = None,
+) -> str:
+    expectation_id = expectation_id or stable_id(
+        "exp", stock_code, report_date, forecast_period, org_name, author_name, source
+    )
+    raw = raw_json if isinstance(raw_json, str) else dumps(raw_json or {})
+    conn.execute(
+        """
+        INSERT INTO analyst_expectations(
+          expectation_id, stock_code, report_date, forecast_period, org_name,
+          author_name, report_title, forecast_revenue, forecast_net_profit,
+          forecast_eps, forecast_pe, rating, target_price_min, target_price_max,
+          source, source_url, source_fetched_at, confidence, raw_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(stock_code, report_date, forecast_period, org_name, author_name)
+        DO UPDATE SET
+          expectation_id = excluded.expectation_id,
+          report_title = excluded.report_title,
+          forecast_revenue = excluded.forecast_revenue,
+          forecast_net_profit = excluded.forecast_net_profit,
+          forecast_eps = excluded.forecast_eps,
+          forecast_pe = excluded.forecast_pe,
+          rating = excluded.rating,
+          target_price_min = excluded.target_price_min,
+          target_price_max = excluded.target_price_max,
+          source = excluded.source,
+          source_url = excluded.source_url,
+          source_fetched_at = excluded.source_fetched_at,
+          confidence = excluded.confidence,
+          raw_json = excluded.raw_json
+        """,
+        (
+            expectation_id,
+            stock_code,
+            report_date,
+            forecast_period,
+            org_name,
+            author_name,
+            report_title,
+            forecast_revenue,
+            forecast_net_profit,
+            forecast_eps,
+            forecast_pe,
+            rating,
+            target_price_min,
+            target_price_max,
+            source,
+            source_url,
+            source_fetched_at,
+            confidence,
+            raw,
+        ),
+    )
+    return expectation_id
+
+
+def upsert_earnings_surprise(
+    conn: sqlite3.Connection,
+    *,
+    stock_code: str,
+    report_period: str,
+    as_of_date: str,
+    surprise_type: str,
+    expected_net_profit: float | None = None,
+    actual_net_profit: float | None = None,
+    surprise_amount: float | None = None,
+    surprise_pct: float | None = None,
+    actual_id: str | None = None,
+    expectation_snapshot_id: str | None = None,
+    expected_revenue: float | None = None,
+    actual_revenue: float | None = None,
+    revenue_surprise_pct: float | None = None,
+    expectation_sample_size: int = 0,
+    expectation_source: str = "unknown",
+    actual_source: str = "unknown",
+    evidence_level: str = "INFERRED",
+    confidence: float = 1.0,
+    raw_json: dict[str, Any] | str | None = None,
+    surprise_id: str | None = None,
+) -> str:
+    assert_member(surprise_type, SURPRISE_TYPES, "surprise_type")
+    assert_member(evidence_level, EVIDENCE_CONFIDENCE, "evidence_level")
+    surprise_id = surprise_id or stable_id("surp", stock_code, report_period)
+    raw = raw_json if isinstance(raw_json, str) else dumps(raw_json or {})
+    if surprise_amount is None and expected_net_profit is not None and actual_net_profit is not None:
+        surprise_amount = actual_net_profit - expected_net_profit
+    if surprise_pct is None and surprise_amount is not None and expected_net_profit:
+        surprise_pct = surprise_amount / abs(expected_net_profit)
+    conn.execute(
+        """
+        INSERT INTO earnings_surprises(
+          surprise_id, stock_code, report_period, ann_date, expected_net_profit,
+          actual_net_profit, net_profit_surprise_pct, expected_revenue, actual_revenue,
+          revenue_surprise_pct, expectation_sample_size, expectation_source,
+          actual_source, evidence_json, actual_id, expectation_snapshot_id,
+          surprise_amount, surprise_pct, surprise_type, as_of_date, evidence_level,
+          confidence, raw_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(stock_code, report_period) DO UPDATE SET
+          expected_net_profit = excluded.expected_net_profit,
+          actual_net_profit = excluded.actual_net_profit,
+          net_profit_surprise_pct = excluded.net_profit_surprise_pct,
+          expected_revenue = excluded.expected_revenue,
+          actual_revenue = excluded.actual_revenue,
+          revenue_surprise_pct = excluded.revenue_surprise_pct,
+          expectation_sample_size = excluded.expectation_sample_size,
+          expectation_source = excluded.expectation_source,
+          actual_source = excluded.actual_source,
+          evidence_json = excluded.evidence_json,
+          actual_id = excluded.actual_id,
+          expectation_snapshot_id = excluded.expectation_snapshot_id,
+          surprise_amount = excluded.surprise_amount,
+          surprise_pct = excluded.surprise_pct,
+          surprise_type = excluded.surprise_type,
+          as_of_date = excluded.as_of_date,
+          evidence_level = excluded.evidence_level,
+          confidence = excluded.confidence,
+          raw_json = excluded.raw_json
+        """,
+        (
+            surprise_id,
+            stock_code,
+            report_period,
+            as_of_date,
+            expected_net_profit,
+            actual_net_profit,
+            surprise_pct,
+            expected_revenue,
+            actual_revenue,
+            revenue_surprise_pct,
+            expectation_sample_size,
+            expectation_source,
+            actual_source,
+            raw,
+            actual_id,
+            expectation_snapshot_id,
+            surprise_amount,
+            surprise_pct,
+            surprise_type,
+            as_of_date,
+            evidence_level,
+            confidence,
+            raw,
+        ),
+    )
+    return surprise_id
+
+
+def upsert_order_contract_event(
+    conn: sqlite3.Connection,
+    *,
+    stock_code: str,
+    publish_date: str,
+    event_type: str,
+    title: str,
+    source: str,
+    as_of_date: str | None = None,
+    event_date: str | None = None,
+    summary: str | None = None,
+    contract_amount: float | None = None,
+    contract_amount_pct_revenue: float | None = None,
+    counterparty: str | None = None,
+    duration: str | None = None,
+    impact_score: float = 0,
+    source_url: str | None = None,
+    source_fetched_at: str | None = None,
+    confidence: float = 1.0,
+    raw_json: dict[str, Any] | str | None = None,
+    event_id: str | None = None,
+) -> str:
+    as_of_date = as_of_date or publish_date
+    event_date = event_date or publish_date
+    event_id = event_id or stable_id("order", stock_code, publish_date, event_type, title, source)
+    raw = raw_json if isinstance(raw_json, str) else dumps(raw_json or {})
+    conn.execute(
+        """
+        INSERT INTO order_contract_events(
+          event_id, stock_code, ann_date, event_type, customer_name, contract_amount,
+          related_revenue_last_year, order_to_last_year_revenue_pct, source, source_url,
+          extraction_method, confidence, publish_date, as_of_date, title, summary,
+          contract_amount_pct_revenue, counterparty, duration, impact_score,
+          source_fetched_at, raw_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+          ann_date = excluded.ann_date,
+          event_type = excluded.event_type,
+          customer_name = excluded.customer_name,
+          contract_amount = excluded.contract_amount,
+          order_to_last_year_revenue_pct = excluded.order_to_last_year_revenue_pct,
+          source = excluded.source,
+          source_url = excluded.source_url,
+          confidence = excluded.confidence,
+          publish_date = excluded.publish_date,
+          as_of_date = excluded.as_of_date,
+          title = excluded.title,
+          summary = excluded.summary,
+          contract_amount_pct_revenue = excluded.contract_amount_pct_revenue,
+          counterparty = excluded.counterparty,
+          duration = excluded.duration,
+          impact_score = excluded.impact_score,
+          source_fetched_at = excluded.source_fetched_at,
+          raw_json = excluded.raw_json
+        """,
+        (
+            event_id,
+            stock_code,
+            event_date,
+            event_type,
+            counterparty,
+            contract_amount,
+            contract_amount_pct_revenue,
+            source,
+            source_url,
+            "title_level",
+            confidence,
+            publish_date,
+            as_of_date,
+            title,
+            summary,
+            contract_amount_pct_revenue,
+            counterparty,
+            duration,
+            impact_score,
+            source_fetched_at,
+            raw,
+        ),
+    )
+    return event_id
+
+
+def upsert_business_kpi_actual(
+    conn: sqlite3.Connection,
+    *,
+    stock_code: str,
+    report_period: str,
+    kpi_name: str,
+    kpi_value: float,
+    kpi_unit: str,
+    source: str,
+    publish_date: str | None = None,
+    as_of_date: str | None = None,
+    kpi_yoy: float | None = None,
+    kpi_qoq: float | None = None,
+    industry: str | None = None,
+    source_url: str | None = None,
+    source_fetched_at: str | None = None,
+    confidence: float = 1.0,
+    raw_json: dict[str, Any] | str | None = None,
+    kpi_id: str | None = None,
+) -> str:
+    as_of_date = as_of_date or publish_date or report_period
+    kpi_id = kpi_id or stable_id("kpi", stock_code, report_period, kpi_name, source)
+    raw = raw_json if isinstance(raw_json, str) else dumps(raw_json or {})
+    conn.execute(
+        """
+        INSERT INTO business_kpi_actuals(
+          kpi_id, stock_code, period, kpi_name, kpi_value, unit, yoy_pct,
+          qoq_pct, source, source_url, extraction_method, confidence,
+          report_period, publish_date, as_of_date, kpi_unit, kpi_yoy, kpi_qoq,
+          industry, source_fetched_at, raw_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(stock_code, period, kpi_name, source) DO UPDATE SET
+          kpi_id = excluded.kpi_id,
+          kpi_value = excluded.kpi_value,
+          unit = excluded.unit,
+          yoy_pct = excluded.yoy_pct,
+          qoq_pct = excluded.qoq_pct,
+          source_url = excluded.source_url,
+          confidence = excluded.confidence,
+          report_period = excluded.report_period,
+          publish_date = excluded.publish_date,
+          as_of_date = excluded.as_of_date,
+          kpi_unit = excluded.kpi_unit,
+          kpi_yoy = excluded.kpi_yoy,
+          kpi_qoq = excluded.kpi_qoq,
+          industry = excluded.industry,
+          source_fetched_at = excluded.source_fetched_at,
+          raw_json = excluded.raw_json
+        """,
+        (
+            kpi_id,
+            stock_code,
+            report_period,
+            kpi_name,
+            kpi_value,
+            kpi_unit,
+            kpi_yoy,
+            kpi_qoq,
+            source,
+            source_url,
+            "structured",
+            confidence,
+            report_period,
+            publish_date,
+            as_of_date,
+            kpi_unit,
+            kpi_yoy,
+            kpi_qoq,
+            industry,
+            source_fetched_at,
+            raw,
+        ),
+    )
+    return kpi_id
+
+
+def upsert_risk_event(
+    conn: sqlite3.Connection,
+    *,
+    stock_code: str,
+    event_date: str,
+    publish_date: str,
+    as_of_date: str,
+    risk_type: str,
+    title: str,
+    source: str,
+    severity: str = "medium",
+    summary: str | None = None,
+    impact_score: float = 0,
+    source_url: str | None = None,
+    source_fetched_at: str | None = None,
+    confidence: float = 1.0,
+    raw_json: dict[str, Any] | str | None = None,
+    risk_event_id: str | None = None,
+) -> str:
+    assert_member(risk_type, RISK_TYPES, "risk_type")
+    risk_event_id = risk_event_id or stable_id("risk", stock_code, publish_date, risk_type, title, source)
+    raw = raw_json if isinstance(raw_json, str) else dumps(raw_json or {})
+    conn.execute(
+        """
+        INSERT INTO risk_events(
+          risk_event_id, stock_code, event_date, publish_date, as_of_date,
+          risk_type, severity, title, summary, impact_score, source, source_url,
+          source_fetched_at, confidence, raw_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(risk_event_id) DO UPDATE SET
+          event_date = excluded.event_date,
+          publish_date = excluded.publish_date,
+          as_of_date = excluded.as_of_date,
+          risk_type = excluded.risk_type,
+          severity = excluded.severity,
+          title = excluded.title,
+          summary = excluded.summary,
+          impact_score = excluded.impact_score,
+          source = excluded.source,
+          source_url = excluded.source_url,
+          source_fetched_at = excluded.source_fetched_at,
+          confidence = excluded.confidence,
+          raw_json = excluded.raw_json
+        """,
+        (
+            risk_event_id,
+            stock_code,
+            event_date,
+            publish_date,
+            as_of_date,
+            risk_type,
+            severity,
+            title,
+            summary,
+            impact_score,
+            source,
+            source_url,
+            source_fetched_at,
+            confidence,
+            raw,
+        ),
+    )
+    return risk_event_id
+
+
+def latest_financial_actuals_before(conn: sqlite3.Connection, stock_code: str, trading_date: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT * FROM financial_actuals
+        WHERE stock_code = ? AND COALESCE(as_of_date, ann_date) < ?
+        ORDER BY COALESCE(as_of_date, ann_date) DESC, report_period DESC
+        LIMIT 1
+        """,
+        (stock_code, trading_date),
+    ).fetchone()
+
+
+def latest_expectations_before(conn: sqlite3.Connection, stock_code: str, trading_date: str) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """
+            SELECT * FROM analyst_expectations
+            WHERE stock_code = ? AND report_date < ?
+            ORDER BY report_date DESC, forecast_period DESC
+            """,
+            (stock_code, trading_date),
+        )
+    )
+
+
+def latest_earnings_surprises_before(conn: sqlite3.Connection, stock_code: str, trading_date: str) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """
+            SELECT * FROM earnings_surprises
+            WHERE stock_code = ? AND COALESCE(as_of_date, ann_date) < ?
+            ORDER BY COALESCE(as_of_date, ann_date) DESC, report_period DESC
+            """,
+            (stock_code, trading_date),
+        )
+    )
+
+
+def recent_order_contract_events_before(
+    conn: sqlite3.Connection,
+    stock_code: str,
+    trading_date: str,
+    limit: int = 20,
+) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """
+            SELECT * FROM order_contract_events
+            WHERE stock_code = ? AND COALESCE(as_of_date, publish_date, ann_date) < ?
+            ORDER BY COALESCE(as_of_date, publish_date, ann_date) DESC
+            LIMIT ?
+            """,
+            (stock_code, trading_date, limit),
+        )
+    )
+
+
+def recent_business_kpis_before(
+    conn: sqlite3.Connection,
+    stock_code: str,
+    trading_date: str,
+    limit: int = 20,
+) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """
+            SELECT * FROM business_kpi_actuals
+            WHERE stock_code = ? AND COALESCE(as_of_date, publish_date, period) < ?
+            ORDER BY COALESCE(as_of_date, publish_date, period) DESC, period DESC
+            LIMIT ?
+            """,
+            (stock_code, trading_date, limit),
+        )
+    )
+
+
+def recent_risk_events_before(
+    conn: sqlite3.Connection,
+    stock_code: str,
+    trading_date: str,
+    limit: int = 20,
+) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """
+            SELECT * FROM risk_events
+            WHERE stock_code = ? AND as_of_date < ?
+            ORDER BY as_of_date DESC, event_date DESC
+            LIMIT ?
+            """,
+            (stock_code, trading_date, limit),
+        )
+    )
+
+
+def review_rows_for_date(conn: sqlite3.Connection, trading_date: str) -> list[dict[str, Any]]:
+    rows = rows_to_dicts(
+        conn.execute(
+            """
+            SELECT * FROM decision_reviews
+            WHERE trading_date = ?
+            ORDER BY strategy_gene_id, stock_code
+            """,
+            (trading_date,),
+        )
+    )
+    if rows:
+        return rows
+    return rows_to_dicts(conn.execute("SELECT * FROM review_logs WHERE trading_date = ?", (trading_date,)))
 
 
 def insert_memory(

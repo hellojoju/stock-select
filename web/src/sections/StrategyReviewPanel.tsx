@@ -10,6 +10,8 @@ export default function StrategyReviewPanel({
   const target = data ?? list[0] ?? null;
   if (!target) return <p className="memory">运行复盘后显示策略整体复盘。</p>;
   const factorEdges = JSON.parse(String(target.factor_edges_json ?? '{}')) as Record<string, Record<string, number>>;
+  const deterministic = JSON.parse(String(target.deterministic_json ?? '{}')) as Record<string, unknown>;
+  const evidenceCoverage = (deterministic.evidence_coverage ?? {}) as Record<string, number>;
   const signals = (target.signals ?? []) as Array<Record<string, unknown>>;
   return (
     <div className="review-detail">
@@ -28,6 +30,11 @@ export default function StrategyReviewPanel({
             <span>{factor}</span>
             <b>{Number(edge.edge ?? 0).toFixed(3)}</b>
           </div>
+        ))}
+      </div>
+      <div className="evidence-strip">
+        {Object.entries(evidenceCoverage).map(([key, value]) => (
+          <span key={key}>{key.replace(/_/g, ' ')} <b>{(Number(value) * 100).toFixed(0)}%</b></span>
         ))}
       </div>
       <small>{signals.length} open optimization signals</small>

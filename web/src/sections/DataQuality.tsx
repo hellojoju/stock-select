@@ -1,4 +1,5 @@
 import type { Dashboard } from '../types';
+import EvidenceCoverage from './EvidenceCoverage';
 
 export default function DataQuality({ dashboard }: { dashboard: Dashboard }) {
   const summary = dashboard.data_quality_summary as Record<string, unknown> | undefined;
@@ -10,6 +11,7 @@ export default function DataQuality({ dashboard }: { dashboard: Dashboard }) {
         <span>{String((summary?.multidimensional_status as Record<string, unknown> | undefined)?.message ?? '等待数据同步')}</span>
       </div>
       <FactorCoverage summary={summary} />
+      <EvidenceCoverage status={dashboard.evidence_status} />
       <div className="stack compact">
         {(dashboard.data_status ?? []).slice(0, 6).map((item, index) => (
           <div className="quality source-quality" key={`source-${index}`}>

@@ -114,6 +114,7 @@ def propose_strategy_evolution(
     min_signal_confidence: float = 0.65,
     min_signal_dates: int = 3,
     gene_id: str | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     proposals: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -165,46 +166,65 @@ def propose_strategy_evolution(
             skipped.append({"gene_id": parent_gene_id, "reason": "no material review signal"})
             continue
 
-        child_gene_id = create_observing_child_gene(
-            conn,
-            parent,
-            period_start=period_start,
-            period_end=period_end,
-            params=after_params,
-        )
-        event_id = persist_evolution_event(
-            conn,
+        child_gene_id = proposed_child_gene_id(parent, period_start=period_start, period_end=period_end, params=after_params)
+        consumed_signal_ids = sorted({signal_id for item in aggregated_signals for signal_id in item["signal_ids"]})
+        event_id = build_evolution_event_id(
             parent_gene_id=parent_gene_id,
             child_gene_id=child_gene_id,
             event_type="proposal",
             period_start=period_start,
             period_end=period_end,
-            market_environment=market_environment,
-            status="applied",
-            rationale=rationale,
-            before_params=before_params,
-            after_params=after_params,
-            review_signal={"review_signal": signal, "aggregated_signals": aggregated_signals},
         )
-        consume_signals(conn, sorted({signal_id for item in aggregated_signals for signal_id in item["signal_ids"]}))
-        child = repository.get_gene(conn, child_gene_id)
+        child_status = "dry_run"
+        if not dry_run:
+            child_gene_id = create_observing_child_gene(
+                conn,
+                parent,
+                period_start=period_start,
+                period_end=period_end,
+                params=after_params,
+            )
+            event_id = persist_evolution_event(
+                conn,
+                parent_gene_id=parent_gene_id,
+                child_gene_id=child_gene_id,
+                event_type="proposal",
+                period_start=period_start,
+                period_end=period_end,
+                market_environment=market_environment,
+                status="applied",
+                rationale=rationale,
+                before_params=before_params,
+                after_params=after_params,
+                review_signal={"review_signal": signal, "aggregated_signals": aggregated_signals},
+            )
+            consume_signals(conn, consumed_signal_ids)
+            child = repository.get_gene(conn, child_gene_id)
+            child_status = child["status"]
         proposals.append(
             {
                 "event_id": event_id,
                 "parent_gene_id": parent_gene_id,
                 "child_gene_id": child_gene_id,
-                "child_status": child["status"],
+                "child_status": child_status,
+                "dry_run": dry_run,
                 "rationale": rationale,
+                "before_params": before_params,
+                "after_params": after_params,
                 "review_signal": signal,
                 "aggregated_signals": aggregated_signals,
+                "consumed_signal_ids": consumed_signal_ids,
+                "evidence_ids": sorted({evidence_id for item in aggregated_signals for evidence_id in item.get("evidence_ids", [])}),
             }
         )
-    conn.commit()
+    if not dry_run:
+        conn.commit()
     if not proposals:
         reason = "insufficient samples" if skipped else "no active champions"
-        return {"status": "skipped", "reason": reason, "proposals": [], "skipped": skipped}
+        return {"status": "skipped", "reason": reason, "dry_run": dry_run, "proposals": [], "skipped": skipped}
     return {
-        "status": "proposed",
+        "status": "dry_run" if dry_run else "proposed",
+        "dry_run": dry_run,
         "proposals": proposals,
         "skipped": skipped,
     }
@@ -217,17 +237,28 @@ def propose_params_from_optimization_signals(
     after = dict(before_params)
     adjustments: list[dict[str, Any]] = []
     for signal in aggregated_signals:
-        param_name = signal.get("param_name")
+        param_name = resolve_signal_param(signal, after)
         if not param_name or param_name not in after or not isinstance(after[param_name], (int, float)):
             continue
         direction = signal["direction"]
         signal_type = signal["signal_type"]
         strength = float(signal["weighted_strength"])
         factor = 1.0
-        if signal_type in {"increase_weight", "lower_threshold", "adjust_position", "adjust_sell_rule"} and direction in {"up", "down"}:
+        if signal_type in {
+            "increase_weight",
+            "increase_earnings_surprise_weight",
+            "increase_order_event_weight",
+            "increase_kpi_momentum_weight",
+            "increase_risk_penalty",
+            "lower_threshold",
+            "adjust_position",
+            "adjust_sell_rule",
+        } and direction in {"up", "down"}:
             factor = 1.0 + min(0.05, strength * 0.05) if direction == "up" else 1.0 - min(0.05, strength * 0.05)
-        elif signal_type in {"decrease_weight", "raise_threshold"} and direction in {"up", "down"}:
+        elif signal_type in {"decrease_weight", "decrease_earnings_surprise_weight", "raise_threshold"} and direction in {"up", "down"}:
             factor = 1.0 - min(0.05, strength * 0.05) if direction == "down" else 1.0 + min(0.05, strength * 0.05)
+        elif signal_type == "tighten_evidence_coverage_filter":
+            factor = 1.0 + min(0.05, strength * 0.05)
         before = float(after[param_name])
         after[param_name] = round(before * factor, 6)
         adjustments.append(
@@ -253,6 +284,22 @@ def propose_params_from_optimization_signals(
     }
 
 
+def resolve_signal_param(signal: dict[str, Any], params: dict[str, Any]) -> str | None:
+    param_name = signal.get("param_name")
+    if param_name in params:
+        return str(param_name)
+    signal_type = signal.get("signal_type")
+    aliases = {
+        "increase_earnings_surprise_weight": "fundamental_component_weight",
+        "decrease_earnings_surprise_weight": "fundamental_component_weight",
+        "increase_order_event_weight": "event_component_weight",
+        "increase_kpi_momentum_weight": "fundamental_component_weight",
+        "increase_risk_penalty": "risk_component_weight",
+        "tighten_evidence_coverage_filter": "min_score",
+    }
+    return aliases.get(str(signal_type))
+
+
 def create_observing_child_gene(
     conn: sqlite3.Connection,
     parent: sqlite3.Row,
@@ -261,17 +308,7 @@ def create_observing_child_gene(
     period_end: str,
     params: dict[str, Any],
 ) -> str:
-    suffix = hashlib.sha1(
-        repository.dumps(
-            {
-                "parent": parent["gene_id"],
-                "period_start": period_start,
-                "period_end": period_end,
-                "params": params,
-            }
-        ).encode("utf-8")
-    ).hexdigest()[:8]
-    new_gene_id = f"{parent['gene_id']}_challenger_{suffix}"
+    new_gene_id = proposed_child_gene_id(parent, period_start=period_start, period_end=period_end, params=params)
     version = next_gene_version(conn, parent["gene_id"])
     conn.execute(
         """
@@ -292,6 +329,26 @@ def create_observing_child_gene(
         ),
     )
     return new_gene_id
+
+
+def proposed_child_gene_id(
+    parent: sqlite3.Row,
+    *,
+    period_start: str,
+    period_end: str,
+    params: dict[str, Any],
+) -> str:
+    suffix = hashlib.sha1(
+        repository.dumps(
+            {
+                "parent": parent["gene_id"],
+                "period_start": period_start,
+                "period_end": period_end,
+                "params": params,
+            }
+        ).encode("utf-8")
+    ).hexdigest()[:8]
+    return f"{parent['gene_id']}_challenger_{suffix}"
 
 
 def build_review_signal(
@@ -482,6 +539,96 @@ def promote_challenger(
         "parent_gene_id": event["parent_gene_id"],
         "child_gene_id": event["child_gene_id"],
     }
+
+
+def evolution_comparison(
+    conn: sqlite3.Connection,
+    *,
+    gene_id: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+) -> dict[str, Any]:
+    clauses = ["event_type = 'proposal'"]
+    params: list[Any] = []
+    if gene_id:
+        clauses.append("(parent_gene_id = ? OR child_gene_id = ?)")
+        params.extend([gene_id, gene_id])
+    rows = conn.execute(
+        f"""
+        SELECT * FROM strategy_evolution_events
+        WHERE {' AND '.join(clauses)}
+        ORDER BY created_at DESC
+        """,
+        params,
+    ).fetchall()
+    comparisons: list[dict[str, Any]] = []
+    for event in rows:
+        period_start = start or event["period_start"]
+        period_end = end or event["period_end"]
+        review_signal = json.loads(event["review_signal_json"] or "{}")
+        aggregated = review_signal.get("aggregated_signals", [])
+        comparisons.append(
+            {
+                "event_id": event["event_id"],
+                "parent_gene_id": event["parent_gene_id"],
+                "child_gene_id": event["child_gene_id"],
+                "status": event["status"],
+                "period_start": period_start,
+                "period_end": period_end,
+                "parent_performance": gene_performance(conn, event["parent_gene_id"], period_start, period_end),
+                "child_performance": gene_performance(conn, event["child_gene_id"], period_start, period_end)
+                if event["child_gene_id"]
+                else None,
+                "parameter_diff": parameter_diff(
+                    json.loads(event["before_params_json"] or "{}"),
+                    json.loads(event["after_params_json"] or event["before_params_json"] or "{}"),
+                ),
+                "aggregated_signals": aggregated,
+                "evidence_ids": sorted({evidence_id for item in aggregated for evidence_id in item.get("evidence_ids", [])}),
+                "promotion_eligible": promotion_eligible(conn, event["child_gene_id"], period_start, period_end)
+                if event["child_gene_id"]
+                else False,
+            }
+        )
+    return {"comparisons": comparisons}
+
+
+def gene_performance(conn: sqlite3.Connection, gene_id: str, start: str, end: str) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT o.return_pct, o.max_drawdown_intraday_pct
+        FROM pick_decisions p
+        JOIN outcomes o ON o.decision_id = p.decision_id
+        WHERE p.strategy_gene_id = ?
+          AND p.trading_date BETWEEN ? AND ?
+        """,
+        (gene_id, start, end),
+    ).fetchall()
+    returns = [float(row["return_pct"]) for row in rows]
+    wins = [value for value in returns if value > 0]
+    return {
+        "gene_id": gene_id,
+        "trades": len(rows),
+        "avg_return_pct": avg(returns),
+        "win_rate": len(wins) / len(rows) if rows else 0.0,
+        "worst_drawdown_pct": min([float(row["max_drawdown_intraday_pct"]) for row in rows], default=0.0),
+    }
+
+
+def parameter_diff(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, Any]]:
+    diffs: list[dict[str, Any]] = []
+    for key in sorted(set(before) | set(after)):
+        if before.get(key) != after.get(key):
+            diffs.append({"param": key, "before": before.get(key), "after": after.get(key)})
+    return diffs
+
+
+def promotion_eligible(conn: sqlite3.Connection, child_gene_id: str, start: str, end: str) -> bool:
+    child = repository.get_gene(conn, child_gene_id)
+    if child["status"] != "observing":
+        return False
+    perf = gene_performance(conn, child_gene_id, start, end)
+    return int(perf["trades"]) >= 5 and float(perf["avg_return_pct"]) > 0
 
 
 def blindspots_for_gene(

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Clock, AlertCircle, CheckCircle, RefreshCw } from 'lucide-react';
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000';
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:18425';
 
 type RunStatus = {
   run_id: string;
@@ -52,14 +52,15 @@ export default function SchedulerPanel() {
   async function loadAll() {
     setLoading(true);
     try {
-      const [runsRes, errorsRes] = await Promise.all([
-        fetch(`${API_BASE}/api/monitor/runs?limit=20`),
-        fetch(`${API_BASE}/api/monitor/errors`),
+      const [runsRes, errorsRes, dashboardRunsRes] = await Promise.all([
+        fetch(`${API_BASE}/api/monitor/runs?limit=20`).catch(() => null),
+        fetch(`${API_BASE}/api/monitor/errors`).catch(() => null),
+        fetch(`${API_BASE}/api/runs?limit=20`).catch(() => null),
       ]);
-      setRuns(await runsRes.json());
-      setRecentErrors(await errorsRes.json());
-      if (runsRes.ok) {
-        const runsData = await fetch(`${API_BASE}/api/runs?limit=20`).then(r => r.json());
+      if (runsRes?.ok) setRuns(await runsRes.json().catch(() => []));
+      if (errorsRes?.ok) setRecentErrors(await errorsRes.json().catch(() => []));
+      if (dashboardRunsRes?.ok) {
+        const runsData = await dashboardRunsRes.json();
         if (runsData.length > 0 && !date) {
           setDate(runsData[0].trading_date);
         }

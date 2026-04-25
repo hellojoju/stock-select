@@ -5,7 +5,15 @@ import sqlite3
 import pytest
 
 from stock_select.db import connect, init_db
-from stock_select.evidence_sync import sync_financial_actuals, sync_earnings_surprises
+from stock_select.evidence_sync import (
+    backfill_evidence_range,
+    sync_analyst_expectations,
+    sync_evidence,
+    sync_financial_actuals,
+    sync_order_contract_events,
+    sync_risk_events,
+    sync_earnings_surprises,
+)
 from stock_select.data_ingestion import DemoProvider
 
 
@@ -20,18 +28,68 @@ def db(tmp_path):
 
 
 class TestSyncFinancialActuals:
-    def test_returns_zero_when_provider_lacks_method(self, db):
-        """DemoProvider does not implement fetch_financial_actuals."""
+    def test_sync_loads_demo_financial_actuals(self, db):
         provider = DemoProvider("demo")
         result = sync_financial_actuals(db, "2024-01-15", provider)
-        assert result["rows_loaded"] == 0
+        assert result["rows_loaded"] == 2
+        assert db.execute("SELECT COUNT(*) AS c FROM financial_actuals").fetchone()["c"] == 2
 
-    def test_returns_zero_for_empty_provider_list(self, db):
-        """Provider with empty fetch returns zero."""
+    def test_sync_financial_actuals_is_idempotent(self, db):
         provider = DemoProvider("demo")
-        # fetch method doesn't exist, should return 0
-        result = sync_financial_actuals(db, "2024-01-15", provider)
+        first = sync_financial_actuals(db, "2024-01-15", provider)
+        second = sync_financial_actuals(db, "2024-01-15", provider)
+        assert first["rows_loaded"] == 2
+        assert second["rows_loaded"] == 0
+        assert db.execute("SELECT COUNT(*) AS c FROM financial_actuals").fetchone()["c"] == 2
+
+
+class TestSyncEvidenceMvp:
+    def test_sync_evidence_populates_demo_tables(self, db):
+        provider = DemoProvider("demo")
+        result = sync_evidence(db, "2024-01-15", providers=[provider])
+        assert result["financial_actuals"]["rows_loaded"] == 2
+        assert result["analyst_expectations"]["rows_loaded"] == 2
+        assert result["earnings_surprises"]["rows_loaded"] == 2
+        assert result["order_contract_events"]["rows_loaded"] == 1
+        assert result["business_kpi_actuals"]["rows_loaded"] == 2
+        assert result["risk_events"]["rows_loaded"] == 1
+
+    def test_order_and_risk_events_are_idempotent(self, db):
+        provider = DemoProvider("demo")
+        first_order = sync_order_contract_events(db, "2024-01-15", provider=provider)
+        second_order = sync_order_contract_events(db, "2024-01-15", provider=provider)
+        assert first_order["rows_loaded"] == 1
+        assert second_order["rows_loaded"] == 0
+        first_risk = sync_risk_events(db, "2024-01-15", provider=provider)
+        second_risk = sync_risk_events(db, "2024-01-15", provider=provider)
+        assert first_risk["rows_loaded"] == 1
+        assert second_risk["rows_loaded"] == 0
+
+    def test_unsupported_expectation_provider_is_skipped(self, db):
+        class UnsupportedExpectationProvider(DemoProvider):
+            source = "unsupported"
+
+            def fetch_analyst_expectations(self, trading_date, stock_codes):  # noqa: ANN001
+                from stock_select.data_ingestion import UnsupportedDatasetError
+
+                raise UnsupportedDatasetError("not configured")
+
+        provider = UnsupportedExpectationProvider("unsupported")
+        result = sync_analyst_expectations(db, "2024-01-15", provider)
         assert result["rows_loaded"] == 0
+        status = db.execute(
+            "SELECT status FROM data_sources WHERE source = 'unsupported' AND dataset = 'analyst_expectations'"
+        ).fetchone()
+        assert status["status"] == "skipped"
+
+    def test_backfill_evidence_uses_open_trading_days(self, db):
+        db.execute("INSERT INTO trading_days(trading_date, is_open) VALUES ('2024-01-15', 1)")
+        db.execute("INSERT INTO trading_days(trading_date, is_open) VALUES ('2024-01-16', 0)")
+        db.execute("INSERT INTO trading_days(trading_date, is_open) VALUES ('2024-01-17', 1)")
+        db.commit()
+        result = backfill_evidence_range(db, "2024-01-15", "2024-01-17", providers=[DemoProvider("demo")])
+        assert result["days"] == ["2024-01-15", "2024-01-17"]
+        assert len(result["results"]) == 2
 
 
 class TestSyncEarningsSurprises:

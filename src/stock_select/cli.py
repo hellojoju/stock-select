@@ -15,7 +15,8 @@ from .data_ingestion import (
     sync_daily_prices,
 )
 from .db import connect, init_db
-from .evolution import promote_challenger, propose_strategy_evolution, rollback_evolution, score_genes
+from .evidence_sync import backfill_evidence_range, sync_evidence
+from .evolution import evolution_comparison, promote_challenger, propose_strategy_evolution, rollback_evolution, score_genes
 from .graph import sync_decision_graph
 from .memory import search_memory
 from .runtime import resolve_runtime
@@ -76,11 +77,19 @@ def main() -> None:
             "sync_fundamentals",
             "sync_event_signals",
             "sync_factors",
+            "sync_financial_actuals",
+            "sync_analyst_expectations",
+            "compute_earnings_surprises",
+            "sync_order_contract_events",
+            "sync_business_kpi_actuals",
+            "sync_risk_events",
+            "sync_evidence",
             "preopen_pick",
             "simulate",
             "review",
             "deterministic_review",
             "blindspot_review",
+            "analyst_review",
             "gene_review",
             "system_review",
             "review_consolidation",
@@ -135,6 +144,18 @@ def main() -> None:
     backfill_factors.add_argument("--no-resume", action="store_false", dest="resume")
     backfill_factors.add_argument("--throttle-seconds", type=float, default=0.0)
 
+    backfill_evidence = subparsers.add_parser("backfill-evidence", help="Backfill structured review evidence over open trading days")
+    add_runtime_args(backfill_evidence)
+    backfill_evidence.add_argument("--start", required=True)
+    backfill_evidence.add_argument("--end", required=True)
+    backfill_evidence.add_argument("--source", choices=["akshare", "baostock", "demo", "all"], default="all")
+    backfill_evidence.add_argument("--limit", type=int, default=500)
+    backfill_evidence.add_argument("--offset", type=int, default=0)
+    backfill_evidence.add_argument("--batch-size", type=int, default=100)
+    backfill_evidence.add_argument("--resume", action="store_true", default=True)
+    backfill_evidence.add_argument("--no-resume", action="store_false", dest="resume")
+    backfill_evidence.add_argument("--throttle-seconds", type=float, default=0.0)
+
     perf = subparsers.add_parser("performance", help="Show strategy performance")
     add_runtime_args(perf)
     perf.add_argument("--date", help="Optional trading date")
@@ -154,9 +175,11 @@ def main() -> None:
 
     propose = subparsers.add_parser("propose-evolution", help="Create review-driven challenger strategy versions")
     add_runtime_args(propose)
-    propose.add_argument("--start", required=True)
-    propose.add_argument("--end", required=True)
+    propose.add_argument("--start")
+    propose.add_argument("--end")
+    propose.add_argument("--date", help="Convenience shortcut for --start DATE --end DATE")
     propose.add_argument("--gene-id")
+    propose.add_argument("--dry-run", action="store_true")
     propose.add_argument("--min-trades", type=int, default=20)
     propose.add_argument("--min-signal-samples", type=int, default=5)
     propose.add_argument("--min-signal-confidence", type=float, default=0.65)
@@ -173,10 +196,16 @@ def main() -> None:
     promote.add_argument("--child-gene-id", required=True)
     promote.add_argument("--reason", default="manual promotion")
 
+    compare = subparsers.add_parser("evolution-comparison", help="Compare champion and challenger performance")
+    add_runtime_args(compare)
+    compare.add_argument("--gene-id")
+    compare.add_argument("--start")
+    compare.add_argument("--end")
+
     serve = subparsers.add_parser("serve", help="Run the stdlib HTTP API server")
     add_runtime_args(serve)
     serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--port", type=int, default=18425)
 
     args = parser.parse_args()
     runtime = resolve_runtime(args.mode or "demo", args.db)
@@ -257,6 +286,19 @@ def main() -> None:
             throttle_seconds=args.throttle_seconds,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif args.command == "backfill-evidence":
+        result = backfill_evidence_range(
+            conn,
+            args.start,
+            args.end,
+            providers=providers_for_source(args.source),
+            limit=args.limit,
+            offset=args.offset,
+            batch_size=args.batch_size,
+            resume=args.resume,
+            throttle_seconds=args.throttle_seconds,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
     elif args.command == "performance":
         print(json.dumps(summarize_performance(conn, args.date), indent=2))
     elif args.command == "memory-search":
@@ -266,17 +308,22 @@ def main() -> None:
     elif args.command == "score-genes":
         print(json.dumps(score_genes(conn, period_start=args.start, period_end=args.end), indent=2, ensure_ascii=False))
     elif args.command == "propose-evolution":
+        period_start = args.start or args.date
+        period_end = args.end or args.date
+        if not period_start or not period_end:
+            raise SystemExit("propose-evolution requires --start/--end or --date")
         print(
             json.dumps(
                 propose_strategy_evolution(
                     conn,
-                    period_start=args.start,
-                    period_end=args.end,
+                    period_start=period_start,
+                    period_end=period_end,
                     gene_id=args.gene_id,
                     min_trades=args.min_trades,
                     min_signal_samples=args.min_signal_samples,
                     min_signal_confidence=args.min_signal_confidence,
                     min_signal_dates=args.min_signal_dates,
+                    dry_run=args.dry_run,
                 ),
                 indent=2,
                 ensure_ascii=False,
@@ -299,6 +346,14 @@ def main() -> None:
         print(
             json.dumps(
                 promote_challenger(conn, child_gene_id=args.child_gene_id, reason=args.reason),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    elif args.command == "evolution-comparison":
+        print(
+            json.dumps(
+                evolution_comparison(conn, gene_id=args.gene_id, start=args.start, end=args.end),
                 indent=2,
                 ensure_ascii=False,
             )

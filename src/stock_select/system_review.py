@@ -44,6 +44,7 @@ def run_system_review(conn: sqlite3.Connection, trading_date: str) -> str:
             "SELECT COUNT(*) AS count FROM decision_reviews WHERE trading_date = ?",
             (trading_date,),
         ).fetchone()["count"],
+        "evidence_coverage": evidence_coverage_summary(conn, trading_date),
     }
     summary = (
         f"{trading_date}: {int(picks or 0)} picks, {int(blindspots or 0)} blindspots, "
@@ -129,6 +130,42 @@ def top_system_errors(conn: sqlite3.Connection, trading_date: str) -> list[dict[
     return [dict(row) for row in rows]
 
 
+def evidence_coverage_summary(conn: sqlite3.Connection, trading_date: str) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT stock_code
+        FROM pick_decisions
+        WHERE trading_date = ?
+        """,
+        (trading_date,),
+    ).fetchall()
+    total = len(rows)
+    counts = {
+        "financial_actuals": 0,
+        "analyst_expectations": 0,
+        "earnings_surprises": 0,
+        "order_contract_events": 0,
+        "business_kpi_actuals": 0,
+        "risk_events": 0,
+    }
+    for row in rows:
+        stock_code = row["stock_code"]
+        if repository.latest_financial_actuals_before(conn, stock_code, trading_date):
+            counts["financial_actuals"] += 1
+        if repository.latest_expectations_before(conn, stock_code, trading_date):
+            counts["analyst_expectations"] += 1
+        if repository.latest_earnings_surprises_before(conn, stock_code, trading_date):
+            counts["earnings_surprises"] += 1
+        if repository.recent_order_contract_events_before(conn, stock_code, trading_date, limit=1):
+            counts["order_contract_events"] += 1
+        if repository.recent_business_kpis_before(conn, stock_code, trading_date, limit=1):
+            counts["business_kpi_actuals"] += 1
+        if repository.recent_risk_events_before(conn, stock_code, trading_date, limit=1):
+            counts["risk_events"] += 1
+    coverage = {key: (value / total if total else 0.0) for key, value in counts.items()}
+    missing = [key for key, value in coverage.items() if value == 0]
+    return {"total_picks": total, "counts": counts, "coverage": coverage, "missing_dimensions": missing}
+
+
 def build_system_review_id(trading_date: str) -> str:
     return "sysrev_" + hashlib.sha1(trading_date.encode("utf-8")).hexdigest()[:12]
-

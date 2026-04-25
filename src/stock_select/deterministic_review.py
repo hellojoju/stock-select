@@ -10,7 +10,19 @@ from .optimization_signals import upsert_optimization_signal
 from .review_schema import DecisionReviewContract
 
 
-REVIEW_FACTORS = ["technical", "fundamental", "event", "sector", "risk", "execution"]
+REVIEW_FACTORS = [
+    "technical",
+    "fundamental",
+    "event",
+    "sector",
+    "risk",
+    "execution",
+    "earnings_surprise",
+    "order_contract",
+    "business_kpi",
+    "risk_event",
+    "expectation",
+]
 
 
 def run_deterministic_review(conn: sqlite3.Connection, trading_date: str) -> list[str]:
@@ -41,7 +53,8 @@ def review_decision(conn: sqlite3.Connection, decision_id: str) -> str:
         "hit_sell_rule": row["hit_sell_rule"],
     }
     evidence_ids = upsert_decision_evidence(conn, review_id, row, packet)
-    factor_items = build_factor_items(row, packet, evidence_ids)
+    evidence_by_source = evidence_ids_by_source(conn, review_id)
+    factor_items = build_factor_items(conn, row, packet, evidence_ids, evidence_by_source)
     verdict = overall_verdict(outcome["return_pct"], factor_items)
     primary_driver = choose_primary_driver(factor_items, packet)
     summary = (
@@ -182,8 +195,10 @@ def upsert_decision_evidence(conn: sqlite3.Connection, review_id: str, row: sqli
     for table, source_type in [
         ("earnings_surprises", "earnings_surprise"),
         ("financial_actuals", "financial_actual"),
+        ("analyst_expectations", "analyst_expectation"),
         ("order_contract_events", "order_contract"),
         ("business_kpi_actuals", "business_kpi"),
+        ("risk_events", "risk_event"),
     ]:
         for extra in domain_evidence(conn, table, row["stock_code"], row["trading_date"]):
             evidence.append((source_type, extra["source_id"], extra["visibility"], extra["confidence"], extra["payload"]))
@@ -221,50 +236,83 @@ def upsert_decision_evidence(conn: sqlite3.Connection, review_id: str, row: sqli
 
 def domain_evidence(conn: sqlite3.Connection, table: str, stock_code: str, trading_date: str) -> list[dict[str, Any]]:
     if table == "earnings_surprises":
-        rows = conn.execute(
-            "SELECT * FROM earnings_surprises WHERE stock_code = ? AND ann_date <= ? ORDER BY ann_date DESC LIMIT 2",
-            (stock_code, trading_date),
-        ).fetchall()
+        rows = repository.latest_earnings_surprises_before(conn, stock_code, trading_date)[:2]
         return [
             {
                 "source_id": row["surprise_id"],
-                "visibility": "PREOPEN_VISIBLE" if row["ann_date"] < trading_date else "POSTCLOSE_OBSERVED",
-                "confidence": "EXTRACTED",
+                "visibility": "PREOPEN_VISIBLE",
+                "confidence": row["evidence_level"] or "INFERRED",
                 "payload": dict(row),
             }
             for row in rows
         ]
     if table == "financial_actuals":
-        rows = conn.execute(
-            "SELECT * FROM financial_actuals WHERE stock_code = ? AND ann_date <= ? ORDER BY ann_date DESC LIMIT 2",
-            (stock_code, trading_date),
-        ).fetchall()
-        return [{"source_id": f"{row['stock_code']}:{row['report_period']}:{row['source']}", "visibility": "PREOPEN_VISIBLE", "confidence": "EXTRACTED", "payload": dict(row)} for row in rows]
+        row = repository.latest_financial_actuals_before(conn, stock_code, trading_date)
+        rows = [row] if row is not None else []
+        return [{"source_id": row["actual_id"] or f"{row['stock_code']}:{row['report_period']}:{row['source']}", "visibility": "PREOPEN_VISIBLE", "confidence": "EXTRACTED", "payload": dict(row)} for row in rows]
+    if table == "analyst_expectations":
+        rows = repository.latest_expectations_before(conn, stock_code, trading_date)[:3]
+        return [{"source_id": row["expectation_id"], "visibility": "PREOPEN_VISIBLE", "confidence": "EXTRACTED", "payload": dict(row)} for row in rows]
     if table == "order_contract_events":
-        rows = conn.execute(
-            "SELECT * FROM order_contract_events WHERE stock_code = ? AND ann_date <= ? ORDER BY ann_date DESC LIMIT 3",
-            (stock_code, trading_date),
-        ).fetchall()
+        rows = repository.recent_order_contract_events_before(conn, stock_code, trading_date, limit=3)
         return [{"source_id": row["event_id"], "visibility": "PREOPEN_VISIBLE", "confidence": "INFERRED", "payload": dict(row)} for row in rows]
-    rows = conn.execute(
-        "SELECT * FROM business_kpi_actuals WHERE stock_code = ? ORDER BY period DESC LIMIT 3",
-        (stock_code,),
-    ).fetchall()
-    return [{"source_id": row["kpi_id"], "visibility": "PREOPEN_VISIBLE", "confidence": "INFERRED", "payload": dict(row)} for row in rows]
+    if table == "business_kpi_actuals":
+        rows = repository.recent_business_kpis_before(conn, stock_code, trading_date, limit=3)
+        return [{"source_id": row["kpi_id"], "visibility": "PREOPEN_VISIBLE", "confidence": "INFERRED", "payload": dict(row)} for row in rows]
+    rows = repository.recent_risk_events_before(conn, stock_code, trading_date, limit=3)
+    return [{"source_id": row["risk_event_id"], "visibility": "PREOPEN_VISIBLE", "confidence": "INFERRED", "payload": dict(row)} for row in rows]
 
 
-def build_factor_items(row: sqlite3.Row, packet: dict[str, Any], evidence_ids: list[str]) -> list[dict[str, Any]]:
+def build_factor_items(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    packet: dict[str, Any],
+    evidence_ids: list[str],
+    evidence_by_source: dict[str, list[str]],
+) -> list[dict[str, Any]]:
     return_pct = float(row["return_pct"])
     drawdown = float(row["max_drawdown_intraday_pct"])
+    stock_code = row["stock_code"]
+    trading_date = row["trading_date"]
+    surprises = repository.latest_earnings_surprises_before(conn, stock_code, trading_date)
+    expectations = repository.latest_expectations_before(conn, stock_code, trading_date)
+    orders = repository.recent_order_contract_events_before(conn, stock_code, trading_date)
+    kpis = repository.recent_business_kpis_before(conn, stock_code, trading_date)
+    risks = repository.recent_risk_events_before(conn, stock_code, trading_date)
+    financial_actual = repository.latest_financial_actuals_before(conn, stock_code, trading_date)
+    base_evidence = ids_for_sources(evidence_by_source, ["candidate_score", "daily_price", "outcome"], fallback=evidence_ids)
     items = [
-        technical_check(row, packet, return_pct, evidence_ids),
-        fundamental_check(row, packet, return_pct, drawdown, evidence_ids),
-        event_check(row, packet, return_pct, evidence_ids),
-        sector_check(row, packet, return_pct, evidence_ids),
-        risk_check(row, packet, return_pct, drawdown, evidence_ids),
-        execution_check(row, return_pct, evidence_ids),
+        technical_check(row, packet, return_pct, base_evidence),
+        fundamental_check(row, packet, return_pct, drawdown, ids_for_sources(evidence_by_source, ["financial_actual", "candidate_score"], fallback=evidence_ids)),
+        event_check(row, packet, return_pct, ids_for_sources(evidence_by_source, ["order_contract", "candidate_score"], fallback=evidence_ids)),
+        sector_check(row, packet, return_pct, base_evidence),
+        risk_check(row, packet, return_pct, drawdown, ids_for_sources(evidence_by_source, ["risk_event", "candidate_score"], fallback=evidence_ids)),
+        execution_check(row, return_pct, base_evidence),
+        earnings_surprise_check(row, surprises, ids_for_sources(evidence_by_source, ["earnings_surprise", "analyst_expectation", "financial_actual"], fallback=evidence_ids)),
+        order_contract_check(row, orders, ids_for_sources(evidence_by_source, ["order_contract"], fallback=evidence_ids)),
+        business_kpi_check(row, kpis, ids_for_sources(evidence_by_source, ["business_kpi"], fallback=evidence_ids)),
+        risk_event_check(row, risks, ids_for_sources(evidence_by_source, ["risk_event"], fallback=evidence_ids)),
+        expectation_check(row, expectations, financial_actual, ids_for_sources(evidence_by_source, ["analyst_expectation", "financial_actual"], fallback=evidence_ids)),
     ]
     return items
+
+
+def evidence_ids_by_source(conn: sqlite3.Connection, review_id: str) -> dict[str, list[str]]:
+    rows = conn.execute(
+        "SELECT evidence_id, source_type FROM review_evidence WHERE review_id = ? ORDER BY source_type",
+        (review_id,),
+    ).fetchall()
+    grouped: dict[str, list[str]] = {}
+    for row in rows:
+        grouped.setdefault(row["source_type"], []).append(row["evidence_id"])
+    return grouped
+
+
+def ids_for_sources(grouped: dict[str, list[str]], source_types: list[str], *, fallback: list[str]) -> list[str]:
+    ids: list[str] = []
+    for source_type in source_types:
+        ids.extend(grouped.get(source_type, []))
+    return ids[:5] if ids else fallback[:3]
 
 
 def technical_check(row: sqlite3.Row, packet: dict[str, Any], return_pct: float, evidence_ids: list[str]) -> dict[str, Any]:
@@ -333,6 +381,136 @@ def execution_check(row: sqlite3.Row, return_pct: float, evidence_ids: list[str]
     else:
         verdict, error_type = "RIGHT", None
     return factor_item("execution", {"entry_plan": repository.loads(row["entry_plan_json"], {})}, {"hit_sell_rule": row["hit_sell_rule"]}, verdict, return_pct, error_type, evidence_ids)
+
+
+def earnings_surprise_check(
+    row: sqlite3.Row,
+    surprises: list[sqlite3.Row],
+    evidence_ids: list[str],
+) -> dict[str, Any]:
+    latest = surprises[0] if surprises else None
+    surprise_pct = float(latest["surprise_pct"] if latest and latest["surprise_pct"] is not None else latest["net_profit_surprise_pct"] if latest and latest["net_profit_surprise_pct"] is not None else 0)
+    surprise_type = latest["surprise_type"] if latest and latest["surprise_type"] else "missing"
+    score = float(row["fundamental_score"] or 0)
+    if surprise_type == "positive_surprise" and score < 0.3:
+        verdict, error_type, contribution = "WRONG", "missed_earnings_surprise", max(0.25, min(1.0, abs(surprise_pct)))
+    elif surprise_type == "positive_surprise":
+        verdict, error_type, contribution = "RIGHT", None, min(1.0, abs(surprise_pct))
+    elif surprise_type == "negative_surprise" and float(row["return_pct"]) <= 0:
+        verdict, error_type, contribution = "RIGHT", None, -min(1.0, abs(surprise_pct))
+    elif surprise_type == "expectation_missing":
+        verdict, error_type, contribution = "INCONCLUSIVE", "analyst_expectation_missing", 0.0
+    elif not latest:
+        verdict, error_type, contribution = "INCONCLUSIVE", "financial_actual_missing", 0.0
+    else:
+        verdict, error_type, contribution = "NEUTRAL", None, 0.0
+    return factor_item(
+        "earnings_surprise",
+        {"fundamental_score": score, "surprise_type": surprise_type},
+        {"surprise_pct": surprise_pct, "available": bool(latest)},
+        verdict,
+        contribution,
+        error_type,
+        evidence_ids,
+    )
+
+
+def order_contract_check(
+    row: sqlite3.Row,
+    orders: list[sqlite3.Row],
+    evidence_ids: list[str],
+) -> dict[str, Any]:
+    positive_orders = [item for item in orders if float(item["impact_score"] or 0) > 0.25]
+    max_impact = max([float(item["impact_score"] or 0) for item in positive_orders], default=0.0)
+    score = float(row["event_score"] or 0)
+    if positive_orders and score < 0.2:
+        verdict, error_type = "WRONG", "missed_order_signal"
+    elif positive_orders:
+        verdict, error_type = "RIGHT", None
+    else:
+        verdict, error_type = "NEUTRAL", None
+    return factor_item(
+        "order_contract",
+        {"event_score": score},
+        {"positive_event_count": len(positive_orders), "max_impact_score": max_impact},
+        verdict,
+        max_impact if verdict != "WRONG" else -max_impact,
+        error_type,
+        evidence_ids,
+    )
+
+
+def business_kpi_check(
+    row: sqlite3.Row,
+    kpis: list[sqlite3.Row],
+    evidence_ids: list[str],
+) -> dict[str, Any]:
+    positive = [item for item in kpis if float(item["kpi_yoy"] if item["kpi_yoy"] is not None else item["yoy_pct"] or 0) > 0.15]
+    max_yoy = max([float(item["kpi_yoy"] if item["kpi_yoy"] is not None else item["yoy_pct"] or 0) for item in positive], default=0.0)
+    score = float(row["fundamental_score"] or 0)
+    if positive and score < 0.3:
+        verdict, error_type = "WRONG", "missed_business_kpi_signal"
+    elif positive:
+        verdict, error_type = "RIGHT", None
+    else:
+        verdict, error_type = "NEUTRAL", None
+    return factor_item(
+        "business_kpi",
+        {"fundamental_score": score},
+        {"positive_kpi_count": len(positive), "max_yoy": max_yoy},
+        verdict,
+        max_yoy if verdict != "WRONG" else -max_yoy,
+        error_type,
+        evidence_ids,
+    )
+
+
+def risk_event_check(
+    row: sqlite3.Row,
+    risks: list[sqlite3.Row],
+    evidence_ids: list[str],
+) -> dict[str, Any]:
+    negative_risks = [item for item in risks if float(item["impact_score"] or 0) < -0.2]
+    worst_impact = min([float(item["impact_score"] or 0) for item in negative_risks], default=0.0)
+    risk_penalty = float(row["risk_penalty"] or 0)
+    if negative_risks and risk_penalty < 0.2:
+        verdict, error_type = "WRONG", "missed_risk_event"
+    elif negative_risks:
+        verdict, error_type = "RIGHT", None
+    else:
+        verdict, error_type = "NEUTRAL", None
+    return factor_item(
+        "risk_event",
+        {"risk_penalty": risk_penalty},
+        {"negative_event_count": len(negative_risks), "worst_impact_score": worst_impact},
+        verdict,
+        worst_impact,
+        error_type,
+        evidence_ids,
+    )
+
+
+def expectation_check(
+    row: sqlite3.Row,
+    expectations: list[sqlite3.Row],
+    financial_actual: sqlite3.Row | None,
+    evidence_ids: list[str],
+) -> dict[str, Any]:
+    if not expectations:
+        verdict, error_type = "INCONCLUSIVE", "analyst_expectation_missing"
+    elif financial_actual is None:
+        verdict, error_type = "INCONCLUSIVE", "financial_actual_missing"
+    else:
+        verdict, error_type = "RIGHT", None
+    return factor_item(
+        "expectation",
+        {"requires_expectation_snapshot": True},
+        {"expectation_count": len(expectations), "has_financial_actual": financial_actual is not None},
+        verdict,
+        0.0,
+        error_type,
+        evidence_ids,
+    )
 
 
 def factor_item(
@@ -425,6 +603,12 @@ def maybe_signal_from_error(conn: sqlite3.Connection, row: sqlite3.Row, review_i
         "risk_underestimated": ("increase_weight", "risk_component_weight", "up"),
         "liquidity_ignored": ("increase_weight", "risk_component_weight", "up"),
         "sell_rule_too_tight": ("adjust_sell_rule", "take_profit_pct", "up"),
+        "missed_earnings_surprise": ("increase_earnings_surprise_weight", "earnings_surprise_weight", "up"),
+        "missed_order_signal": ("increase_order_event_weight", "order_event_weight", "up"),
+        "missed_business_kpi_signal": ("increase_kpi_momentum_weight", "kpi_momentum_weight", "up"),
+        "missed_risk_event": ("increase_risk_penalty", "risk_component_weight", "up"),
+        "analyst_expectation_missing": ("add_data_source", "analyst_expectations", "add"),
+        "financial_actual_missing": ("add_data_source", "financial_actuals", "add"),
     }
     error_type = item.get("error_type")
     if error_type not in mapping:
@@ -495,4 +679,3 @@ def build_item_id(review_id: str, factor_type: str) -> str:
 
 def build_evidence_id(review_id: str, source_type: str, source_id: str) -> str:
     return "ev_" + hashlib.sha1(f"{review_id}:{source_type}:{source_id}".encode("utf-8")).hexdigest()[:14]
-

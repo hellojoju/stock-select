@@ -17,6 +17,10 @@ DEFAULT_INDEX_CODES = ["000300.SH", "000001.SH", "399006.SZ"]
 DEFAULT_FACTOR_STOCK_LIMIT = 500
 
 
+class UnsupportedDatasetError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class StockUniverseItem:
     stock_code: str
@@ -118,6 +122,110 @@ class EventSignalItem:
     sentiment: float = 0.0
 
 
+@dataclass(frozen=True)
+class FinancialActualItem:
+    source: str
+    stock_code: str
+    report_period: str
+    publish_date: str
+    as_of_date: str
+    revenue: float | None = None
+    net_profit: float | None = None
+    deducted_net_profit: float | None = None
+    eps: float | None = None
+    roe: float | None = None
+    gross_margin: float | None = None
+    operating_cashflow: float | None = None
+    debt_to_assets: float | None = None
+    source_url: str | None = None
+    source_fetched_at: str | None = None
+    confidence: float = 1.0
+    raw_json: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class AnalystExpectationItem:
+    source: str
+    stock_code: str
+    report_date: str
+    forecast_period: str
+    org_name: str | None = None
+    author_name: str | None = None
+    report_title: str | None = None
+    forecast_revenue: float | None = None
+    forecast_net_profit: float | None = None
+    forecast_eps: float | None = None
+    forecast_pe: float | None = None
+    rating: str | None = None
+    target_price_min: float | None = None
+    target_price_max: float | None = None
+    source_url: str | None = None
+    source_fetched_at: str | None = None
+    confidence: float = 1.0
+    raw_json: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class OrderContractEventItem:
+    source: str
+    stock_code: str
+    publish_date: str
+    event_type: str
+    title: str
+    as_of_date: str | None = None
+    event_date: str | None = None
+    summary: str | None = None
+    contract_amount: float | None = None
+    contract_amount_pct_revenue: float | None = None
+    counterparty: str | None = None
+    duration: str | None = None
+    impact_score: float = 0.0
+    source_url: str | None = None
+    source_fetched_at: str | None = None
+    confidence: float = 1.0
+    raw_json: dict[str, Any] | None = None
+    event_id: str | None = None
+
+
+@dataclass(frozen=True)
+class BusinessKpiItem:
+    source: str
+    stock_code: str
+    report_period: str
+    kpi_name: str
+    kpi_value: float
+    kpi_unit: str
+    publish_date: str | None = None
+    as_of_date: str | None = None
+    kpi_yoy: float | None = None
+    kpi_qoq: float | None = None
+    industry: str | None = None
+    source_url: str | None = None
+    source_fetched_at: str | None = None
+    confidence: float = 1.0
+    raw_json: dict[str, Any] | None = None
+    kpi_id: str | None = None
+
+
+@dataclass(frozen=True)
+class RiskEventItem:
+    source: str
+    stock_code: str
+    event_date: str
+    publish_date: str
+    as_of_date: str
+    risk_type: str
+    title: str
+    severity: str = "medium"
+    summary: str | None = None
+    impact_score: float = 0.0
+    source_url: str | None = None
+    source_fetched_at: str | None = None
+    confidence: float = 1.0
+    raw_json: dict[str, Any] | None = None
+    risk_event_id: str | None = None
+
+
 class MarketDataProvider(Protocol):
     source: str
 
@@ -140,6 +248,21 @@ class MarketDataProvider(Protocol):
         ...
 
     def fetch_event_signals(self, start: str, end: str, stock_codes: list[str]) -> list[EventSignalItem]:
+        ...
+
+    def fetch_financial_actuals(self, trading_date: str, stock_codes: list[str]) -> list[FinancialActualItem]:
+        ...
+
+    def fetch_analyst_expectations(self, trading_date: str, stock_codes: list[str]) -> list[AnalystExpectationItem]:
+        ...
+
+    def fetch_order_contract_events(self, start: str, end: str, stock_codes: list[str]) -> list[OrderContractEventItem]:
+        ...
+
+    def fetch_business_kpis(self, trading_date: str, stock_codes: list[str]) -> list[BusinessKpiItem]:
+        ...
+
+    def fetch_risk_events(self, start: str, end: str, stock_codes: list[str]) -> list[RiskEventItem]:
         ...
 
 
@@ -266,6 +389,103 @@ class DemoProvider:
                 summary="demo positive order",
                 impact_score=0.45,
                 sentiment=0.4,
+            )
+        ]
+
+    def fetch_financial_actuals(self, trading_date: str, stock_codes: list[str]) -> list[FinancialActualItem]:
+        report_period = f"{parse_date(trading_date).year - 1}-12-31"
+        publish_date = (parse_date(trading_date) - timedelta(days=20)).isoformat()
+        return [
+            FinancialActualItem(
+                source=self.source,
+                stock_code=stock_code,
+                report_period=report_period,
+                publish_date=publish_date,
+                as_of_date=publish_date,
+                revenue=1_000_000_000 + index * 100_000_000,
+                net_profit=100_000_000 + index * 10_000_000,
+                deducted_net_profit=90_000_000 + index * 10_000_000,
+                eps=0.5 + index * 0.1,
+                roe=0.08 + index * 0.01,
+                gross_margin=0.25,
+                operating_cashflow=120_000_000 + index * 10_000_000,
+                debt_to_assets=0.45,
+                raw_json={"provider": "demo"},
+            )
+            for index, stock_code in enumerate(stock_codes)
+        ]
+
+    def fetch_analyst_expectations(self, trading_date: str, stock_codes: list[str]) -> list[AnalystExpectationItem]:
+        report_date = (parse_date(trading_date) - timedelta(days=25)).isoformat()
+        forecast_period = f"{parse_date(trading_date).year - 1}-12-31"
+        return [
+            AnalystExpectationItem(
+                source=self.source,
+                stock_code=stock_code,
+                report_date=report_date,
+                forecast_period=forecast_period,
+                org_name="Demo Securities",
+                author_name="Demo Analyst",
+                forecast_revenue=900_000_000 + index * 100_000_000,
+                forecast_net_profit=80_000_000 + index * 10_000_000,
+                forecast_eps=0.4 + index * 0.1,
+                rating="BUY",
+                raw_json={"provider": "demo"},
+            )
+            for index, stock_code in enumerate(stock_codes)
+        ]
+
+    def fetch_order_contract_events(self, start: str, end: str, stock_codes: list[str]) -> list[OrderContractEventItem]:
+        if not stock_codes:
+            return []
+        return [
+            OrderContractEventItem(
+                source=self.source,
+                stock_code=stock_codes[0],
+                publish_date=start,
+                as_of_date=start,
+                event_type="major_contract",
+                title="demo positive order",
+                summary="demo positive order",
+                impact_score=0.45,
+                raw_json={"provider": "demo"},
+            )
+        ]
+
+    def fetch_business_kpis(self, trading_date: str, stock_codes: list[str]) -> list[BusinessKpiItem]:
+        report_period = f"{parse_date(trading_date).year - 1}-12-31"
+        publish_date = (parse_date(trading_date) - timedelta(days=20)).isoformat()
+        return [
+            BusinessKpiItem(
+                source=self.source,
+                stock_code=stock_code,
+                report_period=report_period,
+                publish_date=publish_date,
+                as_of_date=publish_date,
+                kpi_name="orders",
+                kpi_value=100_000_000 + index * 10_000_000,
+                kpi_unit="CNY",
+                kpi_yoy=0.2,
+                raw_json={"provider": "demo"},
+            )
+            for index, stock_code in enumerate(stock_codes[:2])
+        ]
+
+    def fetch_risk_events(self, start: str, end: str, stock_codes: list[str]) -> list[RiskEventItem]:
+        if len(stock_codes) < 2:
+            return []
+        return [
+            RiskEventItem(
+                source=self.source,
+                stock_code=stock_codes[1],
+                event_date=start,
+                publish_date=start,
+                as_of_date=start,
+                risk_type="shareholder_reduction",
+                title="demo shareholder reduction",
+                severity="medium",
+                impact_score=-0.35,
+                raw_json={"provider": "demo"},
             )
         ]
 
@@ -397,7 +617,7 @@ class AkShareProvider:
         return rows
 
     def fetch_fundamentals(self, trading_date: str, stock_codes: list[str]) -> list[FundamentalMetricItem]:
-        raise RuntimeError("akshare fundamentals are not configured for Phase B; use baostock")
+        raise UnsupportedDatasetError("akshare fundamentals are not configured for Phase B; use baostock")
 
     def fetch_event_signals(self, start: str, end: str, stock_codes: list[str]) -> list[EventSignalItem]:
         try:
@@ -432,6 +652,99 @@ class AkShareProvider:
                         impact_score=impact,
                         sentiment=sentiment,
                     )
+                )
+            current += timedelta(days=1)
+        return rows
+
+    def fetch_financial_actuals(self, trading_date: str, stock_codes: list[str]) -> list[FinancialActualItem]:
+        raise UnsupportedDatasetError("akshare financial_actuals are not configured; use baostock")
+
+    def fetch_analyst_expectations(self, trading_date: str, stock_codes: list[str]) -> list[AnalystExpectationItem]:
+        raise UnsupportedDatasetError("akshare analyst_expectations are not configured")
+
+    def fetch_order_contract_events(self, start: str, end: str, stock_codes: list[str]) -> list[OrderContractEventItem]:
+        notices = self._fetch_notice_rows(start, end, stock_codes)
+        rows: list[OrderContractEventItem] = []
+        for notice in notices:
+            title = notice["title"]
+            event_type, impact, _ = classify_event_title(title)
+            if event_type != "major_contract":
+                continue
+            rows.append(
+                OrderContractEventItem(
+                    source=self.source,
+                    stock_code=notice["stock_code"],
+                    publish_date=notice["published_at"],
+                    as_of_date=notice["published_at"],
+                    event_type=event_type,
+                    title=title,
+                    summary=title,
+                    impact_score=impact,
+                    source_url=notice.get("source_url"),
+                    confidence=0.7,
+                    raw_json=notice,
+                )
+            )
+        return rows
+
+    def fetch_business_kpis(self, trading_date: str, stock_codes: list[str]) -> list[BusinessKpiItem]:
+        raise UnsupportedDatasetError("akshare business_kpis are not configured")
+
+    def fetch_risk_events(self, start: str, end: str, stock_codes: list[str]) -> list[RiskEventItem]:
+        notices = self._fetch_notice_rows(start, end, stock_codes)
+        rows: list[RiskEventItem] = []
+        for notice in notices:
+            title = notice["title"]
+            event_type, impact, _ = classify_event_title(title)
+            risk_type = risk_type_from_event_type(event_type)
+            if risk_type is None:
+                continue
+            severity = "high" if impact <= -0.5 else "medium"
+            rows.append(
+                RiskEventItem(
+                    source=self.source,
+                    stock_code=notice["stock_code"],
+                    event_date=notice["published_at"],
+                    publish_date=notice["published_at"],
+                    as_of_date=notice["published_at"],
+                    risk_type=risk_type,
+                    title=title,
+                    severity=severity,
+                    summary=title,
+                    impact_score=impact,
+                    source_url=notice.get("source_url"),
+                    confidence=0.7,
+                    raw_json=notice,
+                )
+            )
+        return rows
+
+    def _fetch_notice_rows(self, start: str, end: str, stock_codes: list[str]) -> list[dict[str, Any]]:
+        try:
+            import akshare as ak  # type: ignore[import-not-found]
+        except Exception as exc:  # pragma: no cover - depends on optional package
+            raise RuntimeError("akshare is not installed") from exc
+
+        wanted = set(stock_codes)
+        rows: list[dict[str, Any]] = []
+        current = parse_date(start)
+        end_date = parse_date(end)
+        while current <= end_date:
+            date_token = current.strftime("%Y%m%d")
+            frame = ak.stock_notice_report(symbol="全部", date=date_token)
+            for _, item in frame.iterrows():
+                stock_code = normalize_stock_code(str(value_from(item, "代码", "code", "证券代码") or ""))
+                if not stock_code or stock_code not in wanted:
+                    continue
+                title = str(value_from(item, "公告标题", "title") or "")
+                published_at = normalize_date(value_from(item, "公告日期", "date") or current.isoformat())
+                rows.append(
+                    {
+                        "stock_code": stock_code,
+                        "published_at": published_at,
+                        "title": title,
+                        "source_url": value_from(item, "公告链接", "url", "链接"),
+                    }
                 )
             current += timedelta(days=1)
         return rows
@@ -711,6 +1024,66 @@ class BaoStockProvider:
     def fetch_event_signals(self, start: str, end: str, stock_codes: list[str]) -> list[EventSignalItem]:
         return []
 
+    def fetch_financial_actuals(self, trading_date: str, stock_codes: list[str]) -> list[FinancialActualItem]:
+        try:
+            import baostock as bs  # type: ignore[import-not-found]
+        except Exception as exc:  # pragma: no cover - depends on optional package
+            raise RuntimeError("baostock is not installed") from exc
+        rows: list[FinancialActualItem] = []
+        candidates = report_period_candidates(trading_date)
+        with default_socket_timeout(self.timeout_seconds):
+            login = bs.login()
+            if login.error_code != "0":  # pragma: no cover
+                raise RuntimeError(login.error_msg)
+            try:
+                for stock_code in stock_codes:
+                    bs_code = to_baostock_code(stock_code)
+                    for year, quarter in candidates:
+                        profit = baostock_query_first(bs.query_profit_data(bs_code, year=year, quarter=quarter))
+                        if not profit:
+                            continue
+                        report_period = normalize_report_period(profit.get("statDate") or report_period_from_year_quarter(year, quarter))
+                        publish_date = normalize_date(profit.get("pubDate") or conservative_visible_date(report_period, None))
+                        as_of_date = conservative_visible_date(report_period, profit.get("pubDate"))
+                        if as_of_date >= trading_date:
+                            continue
+                        balance = baostock_query_first(bs.query_balance_data(bs_code, year=year, quarter=quarter))
+                        cash = baostock_query_first(bs.query_cash_flow_data(bs_code, year=year, quarter=quarter))
+                        rows.append(
+                            FinancialActualItem(
+                                source=self.source,
+                                stock_code=stock_code,
+                                report_period=report_period,
+                                publish_date=publish_date,
+                                as_of_date=as_of_date,
+                                revenue=safe_float(profit.get("MBRevenue")),
+                                net_profit=safe_float(profit.get("netProfit")),
+                                deducted_net_profit=safe_float(profit.get("npParentCompanyOwners")),
+                                eps=safe_float(profit.get("epsTTM")),
+                                roe=safe_float(profit.get("roeAvg")),
+                                gross_margin=safe_float(profit.get("gpMargin")),
+                                operating_cashflow=safe_float(cash.get("CAToAsset") if cash else None),
+                                debt_to_assets=safe_float(balance.get("liabilityToAsset") if balance else None),
+                                raw_json={"profit": profit, "balance": balance, "cash": cash},
+                            )
+                        )
+                        break
+            finally:  # pragma: no cover
+                bs.logout()
+        return rows
+
+    def fetch_analyst_expectations(self, trading_date: str, stock_codes: list[str]) -> list[AnalystExpectationItem]:
+        raise UnsupportedDatasetError("baostock analyst_expectations are not configured")
+
+    def fetch_order_contract_events(self, start: str, end: str, stock_codes: list[str]) -> list[OrderContractEventItem]:
+        raise UnsupportedDatasetError("baostock order_contract_events are not configured")
+
+    def fetch_business_kpis(self, trading_date: str, stock_codes: list[str]) -> list[BusinessKpiItem]:
+        raise UnsupportedDatasetError("baostock business_kpis are not configured")
+
+    def fetch_risk_events(self, start: str, end: str, stock_codes: list[str]) -> list[RiskEventItem]:
+        raise UnsupportedDatasetError("baostock risk_events are not configured")
+
 
 def sync_all_data(
     conn: sqlite3.Connection,
@@ -736,12 +1109,13 @@ def sync_factors(
     stock_limit: int | None = DEFAULT_FACTOR_STOCK_LIMIT,
 ) -> dict[str, Any]:
     providers = providers or [BaoStockProvider(), AkShareProvider()]
+    factor_start = (parse_date(trading_date) - timedelta(days=90)).isoformat()
     sector_start = (parse_date(trading_date) - timedelta(days=45)).isoformat()
     return {
         "industries": sync_industries(conn, trading_date, providers=providers),
         "sector_signals": sync_sector_signals_range(conn, sector_start, trading_date),
         "fundamentals": sync_fundamentals(conn, trading_date, providers=providers, limit=stock_limit),
-        "event_signals": sync_event_signals(conn, trading_date, trading_date, providers=providers, limit=stock_limit),
+        "event_signals": sync_event_signals(conn, factor_start, trading_date, providers=providers, limit=stock_limit),
     }
 
 
@@ -932,6 +1306,7 @@ def sync_fundamentals(
             continue
         rows_loaded = 0
         failed_chunks: list[dict[str, Any]] = []
+        skipped_provider = False
         provider_codes = selected_codes
         if resume:
             existing = fundamental_stock_codes_before(conn, trading_date, selected_codes, provider.source)
@@ -943,10 +1318,27 @@ def sync_fundamentals(
                     repository.upsert_fundamental_metrics(conn, **row.__dict__)
                     rows_loaded += 1
                 conn.commit()
+            except UnsupportedDatasetError as exc:
+                failed_chunks = []
+                repository.record_data_source_status(
+                    conn,
+                    source=provider.source,
+                    dataset="fundamentals",
+                    trading_date=trading_date,
+                    status="skipped",
+                    rows_loaded=0,
+                    error=str(exc),
+                    source_reliability=reliability_for_source(provider.source),
+                )
+                source_counts[provider.source] = 0
+                skipped_provider = True
+                break
             except Exception as exc:
                 failed_chunks.append({"chunk_index": chunk_index, "stock_count": len(chunk), "error": str(exc)})
             if throttle_seconds > 0:
                 time.sleep(throttle_seconds)
+        if skipped_provider:
+            continue
         status = "warning" if failed_chunks else "ok"
         if failed_chunks and rows_loaded == 0:
             status = "error"
@@ -985,24 +1377,51 @@ def sync_event_signals(
     selected_codes = stock_codes or liquid_stock_codes_before(conn, end, limit=limit, offset=offset)
     source_counts: dict[str, int] = {}
     errors: dict[str, str] = {}
+    dates = date_range(start, end)
     for provider in providers:
         fetch = getattr(provider, "fetch_event_signals", None)
         if fetch is None:
             continue
         rows_loaded = 0
         failed_chunks: list[dict[str, Any]] = []
-        try:
-            rows = fetch(start, end, selected_codes)
-            for row in rows:
-                if resume and event_signal_exists(conn, row.event_id):
-                    continue
-                repository.upsert_event_signal(conn, **row.__dict__)
-                rows_loaded += 1
-            conn.commit()
-        except Exception as exc:
-            failed_chunks.append({"chunk_index": 1, "stock_count": len(selected_codes), "error": str(exc)})
-        if throttle_seconds > 0:
-            time.sleep(throttle_seconds)
+        skipped_dates = 0
+        for date_index, event_date in enumerate(dates, start=1):
+            if resume and data_source_status_is_ok(conn, provider.source, "event_signals", event_date):
+                skipped_dates += 1
+                continue
+            day_loaded = 0
+            try:
+                rows = fetch(event_date, event_date, selected_codes)
+                for row in rows:
+                    if resume and event_signal_exists(conn, row.event_id):
+                        continue
+                    repository.upsert_event_signal(conn, **row.__dict__)
+                    rows_loaded += 1
+                    day_loaded += 1
+                repository.record_data_source_status(
+                    conn,
+                    source=provider.source,
+                    dataset="event_signals",
+                    trading_date=event_date,
+                    status="ok",
+                    rows_loaded=day_loaded,
+                    source_reliability=reliability_for_source(provider.source),
+                )
+                conn.commit()
+            except Exception as exc:
+                failed_chunks.append({"date_index": date_index, "trading_date": event_date, "stock_count": len(selected_codes), "error": str(exc)})
+                repository.record_data_source_status(
+                    conn,
+                    source=provider.source,
+                    dataset="event_signals",
+                    trading_date=event_date,
+                    status="error",
+                    error=str(exc),
+                    source_reliability=reliability_for_source(provider.source),
+                )
+                conn.commit()
+            if throttle_seconds > 0:
+                time.sleep(throttle_seconds)
         status = "warning" if failed_chunks else "ok"
         if failed_chunks and rows_loaded == 0:
             status = "error"
@@ -1021,7 +1440,14 @@ def sync_event_signals(
         if failed_chunks:
             errors[provider.source] = repository.dumps(failed_chunks)
     conn.commit()
-    return {"start": start, "end": end, "sources": source_counts, "errors": errors, "selected_stocks": len(selected_codes)}
+    return {
+        "start": start,
+        "end": end,
+        "dates": len(dates),
+        "sources": source_counts,
+        "errors": errors,
+        "selected_stocks": len(selected_codes),
+    }
 
 
 def backfill_daily_prices_range(
@@ -1291,6 +1717,28 @@ def fundamental_stock_codes_before(
 def event_signal_exists(conn: sqlite3.Connection, event_id: str) -> bool:
     row = conn.execute("SELECT 1 FROM event_signals WHERE event_id = ?", (event_id,)).fetchone()
     return row is not None
+
+
+def data_source_status_is_ok(conn: sqlite3.Connection, source: str, dataset: str, trading_date: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT status FROM data_sources
+        WHERE source = ? AND dataset = ? AND trading_date = ?
+        """,
+        (source, dataset, trading_date),
+    ).fetchone()
+    return bool(row and row["status"] == "ok")
+
+
+def date_range(start: str, end: str) -> list[str]:
+    start_date = parse_date(start)
+    end_date = parse_date(end)
+    days: list[str] = []
+    current = start_date
+    while current <= end_date:
+        days.append(current.isoformat())
+        current += timedelta(days=1)
+    return days
 
 
 def open_trading_dates(conn: sqlite3.Connection, start: str, end: str) -> list[str]:
@@ -1878,6 +2326,16 @@ def classify_event_title(title: str) -> tuple[str, float, float]:
         if any(keyword in text for keyword in keywords):
             return event_type, 0.45, 0.45
     return "announcement", 0.0, 0.0
+
+
+def risk_type_from_event_type(event_type: str) -> str | None:
+    mapping = {
+        "shareholder_reduction": "shareholder_reduction",
+        "litigation": "litigation",
+        "penalty": "regulatory_penalty",
+        "delisting_risk": "delisting_risk",
+    }
+    return mapping.get(event_type)
 
 
 def event_signal_id(source: str, published_at: str, stock_code: str | None, event_type: str, title: str) -> str:

@@ -24,11 +24,21 @@ from .data_ingestion import (
     sync_stock_universe,
     sync_trading_calendar,
 )
+from .evidence_sync import (
+    sync_analyst_expectations,
+    sync_business_kpi_actuals,
+    sync_earnings_surprises,
+    sync_evidence,
+    sync_financial_actuals,
+    sync_order_contract_events,
+    sync_risk_events,
+)
 from .blindspot_review import run_blindspot_review
 from .deterministic_review import run_deterministic_review
 from .evolution import default_week_window, evolve_weekly
 from .gene_review import run_gene_reviews_for_date
 from .review import generate_deterministic_reviews
+from .review_analysts import run_analyst_reviews
 from .simulator import simulate_day
 from .strategies import generate_picks_for_all_genes
 from .system_review import run_system_review
@@ -47,11 +57,19 @@ RUN_PHASES = {
     "sync_fundamentals",
     "sync_event_signals",
     "sync_factors",
+    "sync_financial_actuals",
+    "sync_analyst_expectations",
+    "compute_earnings_surprises",
+    "sync_order_contract_events",
+    "sync_business_kpi_actuals",
+    "sync_risk_events",
+    "sync_evidence",
     "preopen_pick",
     "simulate",
     "review",
     "deterministic_review",
     "blindspot_review",
+    "analyst_review",
     "gene_review",
     "system_review",
     "review_consolidation",
@@ -88,6 +106,20 @@ def run_phase(conn: sqlite3.Connection, phase: str, trading_date: str) -> dict[s
             result = sync_event_signals(conn, trading_date, trading_date)
         elif phase == "sync_factors":
             result = sync_factors(conn, trading_date)
+        elif phase == "sync_financial_actuals":
+            result = sync_financial_actuals(conn, trading_date)
+        elif phase == "sync_analyst_expectations":
+            result = sync_analyst_expectations(conn, trading_date)
+        elif phase == "compute_earnings_surprises":
+            result = sync_earnings_surprises(conn, trading_date)
+        elif phase == "sync_order_contract_events":
+            result = sync_order_contract_events(conn, trading_date, trading_date)
+        elif phase == "sync_business_kpi_actuals":
+            result = sync_business_kpi_actuals(conn, trading_date)
+        elif phase == "sync_risk_events":
+            result = sync_risk_events(conn, trading_date, trading_date)
+        elif phase == "sync_evidence":
+            result = sync_evidence(conn, trading_date)
         elif phase == "preopen_pick":
             result = {"decision_ids": generate_picks_for_all_genes(conn, trading_date)}
         elif phase == "simulate":
@@ -103,6 +135,8 @@ def run_phase(conn: sqlite3.Connection, phase: str, trading_date: str) -> dict[s
             result = {"blindspot_review_ids": run_blindspot_review(conn, trading_date)}
         elif phase == "gene_review":
             result = {"gene_review_ids": run_gene_reviews_for_date(conn, trading_date)}
+        elif phase == "analyst_review":
+            result = {"analyst_reviews": run_analyst_reviews(conn, trading_date)}
         elif phase == "system_review":
             result = {"system_review_id": run_system_review(conn, trading_date)}
         elif phase == "review_consolidation":
@@ -111,7 +145,9 @@ def run_phase(conn: sqlite3.Connection, phase: str, trading_date: str) -> dict[s
                 "system_review_id": run_system_review(conn, trading_date),
             }
         elif phase == "llm_review":
-            result = {"status": "skipped", "reason": "LLM review not configured"}
+            from .llm_review import run_llm_review
+
+            result = run_llm_review(conn, trading_date)
         else:
             start, end = default_week_window()
             result = evolve_weekly(conn, period_start=start, period_end=end)

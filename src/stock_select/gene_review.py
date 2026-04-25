@@ -75,6 +75,7 @@ def review_gene(
     deterministic = {
         "returns": returns,
         "factor_edges": factor_edges,
+        "evidence_coverage": evidence_coverage_for_gene(conn, gene_id, period_start, period_end),
         "top_errors": top_errors,
         "blindspot_count": int(blindspot_count or 0),
     }
@@ -162,7 +163,108 @@ def compute_factor_edges(conn: sqlite3.Connection, gene_id: str, start: str, end
             "loser_avg": mean(losers),
             "edge": mean(winners) - mean(losers),
         }
+    output.update(compute_evidence_edges(conn, gene_id, start, end))
     return output
+
+
+def compute_evidence_edges(conn: sqlite3.Connection, gene_id: str, start: str, end: str) -> dict[str, dict[str, float]]:
+    decisions = conn.execute(
+        """
+        SELECT p.stock_code, p.trading_date, o.return_pct
+        FROM pick_decisions p
+        JOIN outcomes o ON o.decision_id = p.decision_id
+        WHERE p.strategy_gene_id = ?
+          AND p.trading_date BETWEEN ? AND ?
+        """,
+        (gene_id, start, end),
+    ).fetchall()
+    metrics: dict[str, list[tuple[float, float]]] = {
+        "earnings_surprise": [],
+        "order_contract": [],
+        "business_kpi": [],
+        "risk_event": [],
+    }
+    for row in decisions:
+        stock_code = row["stock_code"]
+        trading_date = row["trading_date"]
+        return_pct = float(row["return_pct"])
+        surprise_rows = repository.latest_earnings_surprises_before(conn, stock_code, trading_date)
+        surprise_value = 0.0
+        if surprise_rows:
+            first = surprise_rows[0]
+            surprise_value = float(first["surprise_pct"] if first["surprise_pct"] is not None else first["net_profit_surprise_pct"] or 0)
+        metrics["earnings_surprise"].append((return_pct, surprise_value))
+
+        orders = repository.recent_order_contract_events_before(conn, stock_code, trading_date, limit=5)
+        metrics["order_contract"].append((return_pct, max([float(item["impact_score"] or 0) for item in orders], default=0.0)))
+
+        kpis = repository.recent_business_kpis_before(conn, stock_code, trading_date, limit=5)
+        metrics["business_kpi"].append(
+            (
+                return_pct,
+                max([float(item["kpi_yoy"] if item["kpi_yoy"] is not None else item["yoy_pct"] or 0) for item in kpis], default=0.0),
+            )
+        )
+
+        risks = repository.recent_risk_events_before(conn, stock_code, trading_date, limit=5)
+        metrics["risk_event"].append((return_pct, min([float(item["impact_score"] or 0) for item in risks], default=0.0)))
+
+    output: dict[str, dict[str, float]] = {}
+    for key, values in metrics.items():
+        winners = [value for return_pct, value in values if return_pct > 0]
+        losers = [value for return_pct, value in values if return_pct <= 0]
+        output[key] = {
+            "winner_avg": mean(winners),
+            "loser_avg": mean(losers),
+            "edge": mean(winners) - mean(losers),
+        }
+    return output
+
+
+def evidence_coverage_for_gene(conn: sqlite3.Connection, gene_id: str, start: str, end: str) -> dict[str, float]:
+    decisions = conn.execute(
+        """
+        SELECT stock_code, trading_date
+        FROM pick_decisions
+        WHERE strategy_gene_id = ?
+          AND trading_date BETWEEN ? AND ?
+        """,
+        (gene_id, start, end),
+    ).fetchall()
+    total = len(decisions)
+    if total == 0:
+        return {
+            "financial_actuals": 0.0,
+            "analyst_expectations": 0.0,
+            "earnings_surprises": 0.0,
+            "order_contract_events": 0.0,
+            "business_kpi_actuals": 0.0,
+            "risk_events": 0.0,
+        }
+    counts = {
+        "financial_actuals": 0,
+        "analyst_expectations": 0,
+        "earnings_surprises": 0,
+        "order_contract_events": 0,
+        "business_kpi_actuals": 0,
+        "risk_events": 0,
+    }
+    for row in decisions:
+        stock_code = row["stock_code"]
+        trading_date = row["trading_date"]
+        if repository.latest_financial_actuals_before(conn, stock_code, trading_date):
+            counts["financial_actuals"] += 1
+        if repository.latest_expectations_before(conn, stock_code, trading_date):
+            counts["analyst_expectations"] += 1
+        if repository.latest_earnings_surprises_before(conn, stock_code, trading_date):
+            counts["earnings_surprises"] += 1
+        if repository.recent_order_contract_events_before(conn, stock_code, trading_date, limit=1):
+            counts["order_contract_events"] += 1
+        if repository.recent_business_kpis_before(conn, stock_code, trading_date, limit=1):
+            counts["business_kpi_actuals"] += 1
+        if repository.recent_risk_events_before(conn, stock_code, trading_date, limit=1):
+            counts["risk_events"] += 1
+    return {key: value / total for key, value in counts.items()}
 
 
 def top_errors_for_gene(conn: sqlite3.Connection, gene_id: str, start: str, end: str) -> list[dict[str, Any]]:
@@ -196,6 +298,11 @@ def generate_gene_signals(
         "risk_underestimated": ("increase_weight", "risk_component_weight", "up"),
         "threshold_too_strict": ("lower_threshold", "min_score", "down"),
         "threshold_too_loose": ("raise_threshold", "min_score", "up"),
+        "missed_earnings_surprise": ("increase_earnings_surprise_weight", "earnings_surprise_weight", "up"),
+        "missed_order_signal": ("increase_order_event_weight", "order_event_weight", "up"),
+        "missed_business_kpi_signal": ("increase_kpi_momentum_weight", "kpi_momentum_weight", "up"),
+        "missed_risk_event": ("increase_risk_penalty", "risk_component_weight", "up"),
+        "low_evidence_coverage": ("tighten_evidence_coverage_filter", "evidence_coverage_filter", "up"),
     }
     for error in top_errors:
         error_type = error["error_type"]
@@ -315,4 +422,3 @@ def build_gene_review_id(gene_id: str, start: str, end: str, market_environment:
 
 def mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
-

@@ -52,10 +52,15 @@ def upsert_blindspot_review(conn: sqlite3.Connection, report: sqlite3.Row) -> st
         candidate_score=candidate_score,
         candidate_rows=candidate_rows,
     )
+    evidence_reasons = evidence_reasons_for_blindspot(conn, stock_code, trading_date)
+    evidence_error_type = strongest_blindspot_error(evidence_reasons)
+    if evidence_error_type:
+        primary_reason = f"{primary_reason}; evidence signal: {evidence_error_type}"
     evidence = {
         "blindspot_report_id": report["report_id"],
         "candidate_scores": [dict(row) for row in candidate_rows[:3]],
         "return_pct": float(report["return_pct"]),
+        "evidence_reasons": evidence_reasons,
     }
     blindspot_review_id = build_blindspot_review_id(trading_date, stock_code)
     conn.execute(
@@ -97,7 +102,7 @@ def upsert_blindspot_review(conn: sqlite3.Connection, report: sqlite3.Row) -> st
         ),
     )
     if float(report["return_pct"]) > 0 and affected_gene_ids:
-        error_type = error_for_missed_stage(missed_stage)
+        error_type = evidence_error_type or error_for_missed_stage(missed_stage)
         upsert_review_error(
             conn,
             review_scope="blindspot",
@@ -105,10 +110,10 @@ def upsert_blindspot_review(conn: sqlite3.Connection, report: sqlite3.Row) -> st
             error_type=error_type,
             severity=min(1.0, float(report["return_pct"]) * 5),
             confidence=0.68,
-            evidence_ids=[report["report_id"]],
+            evidence_ids=[report["report_id"], *[item["source_id"] for item in evidence_reasons]],
         )
         for gene_id in affected_gene_ids:
-            signal_type, param_name, direction = signal_for_missed_stage(missed_stage)
+            signal_type, param_name, direction = signal_for_blindspot_error(error_type, missed_stage)
             upsert_optimization_signal(
                 conn,
                 source_type="blindspot_review",
@@ -122,9 +127,74 @@ def upsert_blindspot_review(conn: sqlite3.Connection, report: sqlite3.Row) -> st
                 strength=min(1.0, float(report["return_pct"]) * 4),
                 confidence=0.68,
                 reason=f"{stock_code} blindspot missed at {missed_stage}",
-                evidence_ids=[report["report_id"]],
+                evidence_ids=[report["report_id"], *[item["source_id"] for item in evidence_reasons]],
             )
     return blindspot_review_id
+
+
+def evidence_reasons_for_blindspot(conn: sqlite3.Connection, stock_code: str, trading_date: str) -> list[dict[str, Any]]:
+    reasons: list[dict[str, Any]] = []
+    for row in repository.latest_earnings_surprises_before(conn, stock_code, trading_date):
+        surprise_pct = row["surprise_pct"] if row["surprise_pct"] is not None else row["net_profit_surprise_pct"]
+        if row["surprise_type"] == "positive_surprise" or float(surprise_pct or 0) > 0.1:
+            reasons.append(
+                {
+                    "error_type": "missed_earnings_surprise",
+                    "source_type": "earnings_surprise",
+                    "source_id": row["surprise_id"],
+                    "confidence": row["confidence"],
+                }
+            )
+            break
+    for row in repository.recent_order_contract_events_before(conn, stock_code, trading_date, limit=3):
+        if float(row["impact_score"] or 0) > 0.25:
+            reasons.append(
+                {
+                    "error_type": "missed_order_signal",
+                    "source_type": "order_contract",
+                    "source_id": row["event_id"],
+                    "confidence": row["confidence"],
+                }
+            )
+            break
+    for row in repository.recent_business_kpis_before(conn, stock_code, trading_date, limit=3):
+        yoy = row["kpi_yoy"] if row["kpi_yoy"] is not None else row["yoy_pct"]
+        if float(yoy or 0) > 0.15:
+            reasons.append(
+                {
+                    "error_type": "missed_business_kpi_signal",
+                    "source_type": "business_kpi",
+                    "source_id": row["kpi_id"],
+                    "confidence": row["confidence"],
+                }
+            )
+            break
+    for row in repository.recent_risk_events_before(conn, stock_code, trading_date, limit=3):
+        if float(row["impact_score"] or 0) < -0.2:
+            reasons.append(
+                {
+                    "error_type": "missed_risk_event",
+                    "source_type": "risk_event",
+                    "source_id": row["risk_event_id"],
+                    "confidence": row["confidence"],
+                }
+            )
+            break
+    return reasons
+
+
+def strongest_blindspot_error(reasons: list[dict[str, Any]]) -> str | None:
+    priority = [
+        "missed_earnings_surprise",
+        "missed_order_signal",
+        "missed_business_kpi_signal",
+        "missed_risk_event",
+    ]
+    found = {item["error_type"] for item in reasons}
+    for error_type in priority:
+        if error_type in found:
+            return error_type
+    return None
 
 
 def best_candidate_rank(conn: sqlite3.Connection, trading_date: str, stock_code: str, gene_ids: list[str]) -> int | None:
@@ -184,6 +254,15 @@ def signal_for_missed_stage(stage: str) -> tuple[str, str, str]:
     return "lower_threshold", "min_score", "down"
 
 
+def signal_for_blindspot_error(error_type: str, missed_stage: str) -> tuple[str, str, str]:
+    mapping = {
+        "missed_earnings_surprise": ("increase_earnings_surprise_weight", "earnings_surprise_weight", "up"),
+        "missed_order_signal": ("increase_order_event_weight", "order_event_weight", "up"),
+        "missed_business_kpi_signal": ("increase_kpi_momentum_weight", "kpi_momentum_weight", "up"),
+        "missed_risk_event": ("increase_risk_penalty", "risk_component_weight", "up"),
+    }
+    return mapping.get(error_type) or signal_for_missed_stage(missed_stage)
+
+
 def build_blindspot_review_id(trading_date: str, stock_code: str) -> str:
     return "blindrev_" + hashlib.sha1(f"{trading_date}:{stock_code}".encode("utf-8")).hexdigest()[:12]
-

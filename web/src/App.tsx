@@ -1,145 +1,29 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Activity, AlertTriangle, BrainCircuit, Database, FileSearch, GitBranch, Play, Search, ShieldCheck } from 'lucide-react';
-import Metric from './components/Metric';
-import Panel from './components/Panel';
-import ReviewSummary from './sections/ReviewSummary';
-import PickList from './sections/PickList';
-import StrategyPerformance from './sections/StrategyPerformance';
-import StockReviewPanel from './sections/StockReviewPanel';
-import StrategyReviewPanel from './sections/StrategyReviewPanel';
-import CandidateScores from './sections/CandidateScores';
-import DataQuality from './sections/DataQuality';
-import EvidenceCoverage from './sections/EvidenceCoverage';
-import EvolutionPanel from './sections/EvolutionPanel';
-import LLMReviewPanel from './sections/LLMReviewPanel';
-import MemorySearch from './sections/MemorySearch';
-import type { Comparison, Dashboard, LLMReview, Pick } from './types';
+import { useEffect, useState } from 'react';
+import { Activity, BrainCircuit, Database, GitBranch, Search } from 'lucide-react';
+import DashboardPage from './pages/DashboardPage';
+import ReviewPage from './pages/ReviewPage';
+import EvolutionPage from './pages/EvolutionPage';
+import DataMemoryPage from './pages/DataMemoryPage';
+import type { Dashboard } from './types';
 import './styles.css';
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000';
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:18425';
+
+type View = 'dashboard' | 'review' | 'evolution' | 'data';
 
 export default function App() {
-  const [date, setDate] = useState('');
-  const [dashboard, setDashboard] = useState<Dashboard | null>(null);
-  const [memoryQuery, setMemoryQuery] = useState('收益');
-  const [memory, setMemory] = useState<Array<Record<string, unknown>>>([]);
-  const [stockReview, setStockReview] = useState<Record<string, unknown> | null>(null);
-  const [strategyReviews, setStrategyReviews] = useState<Array<Record<string, unknown>>>([]);
-  const [strategyReview, setStrategyReview] = useState<Record<string, unknown> | null>(null);
-  const [evolutionComparisons, setEvolutionComparisons] = useState<Comparison[]>([]);
-  const [llmReviews, setLlmReviews] = useState<LLMReview[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [view, setView] = useState<View>('dashboard');
 
-  async function loadDashboard(targetDate = date) {
-    setLoading(true);
-    const suffix = targetDate ? `?date=${targetDate}` : '';
-    const response = await fetch(`${API_BASE}/api/dashboard${suffix}`);
-    const json = await response.json();
-    setDashboard(json);
-    if (!date && json.date) setDate(json.date);
-    if (json.date) void loadStrategyReviews(json.date);
-    if (json.date) void loadEvolutionComparisons(json.date);
-    if (json.date) void loadLlmReviews(json.date);
-    setLoading(false);
-  }
-
-  async function trigger(phase: string) {
-    if (!date) return;
-    setLoading(true);
-    await fetch(`${API_BASE}/api/runs/${phase}?date=${date}`, { method: 'POST' });
-    await loadDashboard(date);
-  }
-
-  async function searchMemory() {
-    const response = await fetch(`${API_BASE}/api/memory/search?q=${encodeURIComponent(memoryQuery)}`);
-    setMemory(await response.json());
-  }
-
-  async function loadStockReview(stockCode: string, targetDate = date) {
-    if (!targetDate) return;
-    const response = await fetch(`${API_BASE}/api/reviews/stocks/${stockCode}?date=${targetDate}`);
-    setStockReview(await response.json());
-  }
-
-  async function loadStrategyReviews(targetDate = date) {
-    if (!targetDate) return;
-    const response = await fetch(`${API_BASE}/api/reviews/preopen-strategies?date=${targetDate}`);
-    setStrategyReviews(await response.json());
-  }
-
-  async function loadStrategyReview(geneId: string, targetDate = date) {
-    if (!targetDate) return;
-    const response = await fetch(`${API_BASE}/api/reviews/preopen-strategies/${geneId}?date=${targetDate}`);
-    setStrategyReview(await response.json());
-  }
-
-  async function loadEvolutionComparisons(targetDate = date) {
-    if (!targetDate) return;
-    const response = await fetch(`${API_BASE}/api/evolution/comparison?start=${targetDate}&end=${targetDate}`);
-    const json = await response.json();
-    setEvolutionComparisons(json.comparisons ?? []);
-  }
-
-  async function dryRunEvolution() {
-    if (!date) return;
-    setLoading(true);
-    const response = await fetch(`${API_BASE}/api/evolution/propose?start=${date}&end=${date}&dry_run=true`, { method: 'POST' });
-    const json = await response.json();
-    const dryRunComparisons = (json.proposals ?? []).map((proposal: Record<string, unknown>) => ({
-      event_id: proposal.event_id,
-      parent_gene_id: proposal.parent_gene_id,
-      child_gene_id: proposal.child_gene_id,
-      status: 'dry_run',
-      parent_performance: proposal.review_signal,
-      child_performance: null,
-      parameter_diff: diffParams(
-        (proposal.before_params ?? {}) as Record<string, unknown>,
-        (proposal.after_params ?? {}) as Record<string, unknown>,
-      ),
-      aggregated_signals: proposal.aggregated_signals,
-      promotion_eligible: false,
-    }));
-    setEvolutionComparisons(dryRunComparisons);
-    setLoading(false);
-  }
-
-  async function applyEvolutionProposal() {
-    if (!date) return;
-    setLoading(true);
-    await fetch(`${API_BASE}/api/evolution/propose?start=${date}&end=${date}`, { method: 'POST' });
-    await loadEvolutionComparisons(date);
-    setLoading(false);
-  }
-
-  async function loadLlmReviews(targetDate = date) {
-    if (!targetDate) return;
-    const response = await fetch(`${API_BASE}/api/reviews/llm?date=${targetDate}`);
-    setLlmReviews(await response.json());
-  }
-
-  async function promote(childGeneId: string) {
-    setLoading(true);
-    await fetch(`${API_BASE}/api/evolution/promote?child_gene_id=${encodeURIComponent(childGeneId)}`, { method: 'POST' });
-    await loadEvolutionComparisons(date);
-    setLoading(false);
-  }
-
-  async function rollback(childGeneId: string) {
-    setLoading(true);
-    await fetch(`${API_BASE}/api/evolution/rollback?child_gene_id=${encodeURIComponent(childGeneId)}`, { method: 'POST' });
-    await loadEvolutionComparisons(date);
-    setLoading(false);
-  }
-
-  useEffect(() => {
-    void loadDashboard('');
-  }, []);
-
-  const best = useMemo(() => dashboard?.performance?.[0], [dashboard]);
+  const nav = [
+    { key: 'dashboard' as View, icon: <Activity size={18} />, label: '今日工作台' },
+    { key: 'review' as View, icon: <Search size={18} />, label: '复盘分析' },
+    { key: 'evolution' as View, icon: <BrainCircuit size={18} />, label: '策略进化' },
+    { key: 'data' as View, icon: <Database size={18} />, label: '数据与记忆' },
+  ];
 
   return (
     <main className="shell">
-      <section className="rail">
+      <aside className="rail">
         <div className="brand">
           <span className="brand-mark">SS</span>
           <div>
@@ -148,103 +32,65 @@ export default function App() {
           </div>
         </div>
         <nav>
-          <a><Activity size={18} /> 今日工作台</a>
-          <a><BrainCircuit size={18} /> 策略基因</a>
-          <a><Database size={18} /> 数据质量</a>
-          <a><GitBranch size={18} /> 记忆图谱</a>
+          {nav.map((item) => (
+            <a
+              key={item.key}
+              className={view === item.key ? 'active' : ''}
+              onClick={() => setView(item.key)}
+            >
+              {item.icon} {item.label}
+            </a>
+          ))}
         </nav>
-      </section>
+        <div className="rail-footer">
+          <span className="mode-badge live">LIVE</span>
+          <ModelSwitcher />
+          <small>v0.1 · 模拟盘</small>
+        </div>
+      </aside>
 
       <section className="workspace">
-        <header className="topbar">
-          <div>
-            <p className="eyebrow">Asia/Shanghai · 模拟盘</p>
-            <div className="title-line">
-              <h1>{dashboard?.date ?? '等待数据'}</h1>
-              <span className={`mode-badge ${dashboard?.runtime_mode === 'live' ? 'live' : 'demo'}`}>
-                {String(dashboard?.runtime_mode ?? 'demo').toUpperCase()}
-              </span>
-            </div>
-          </div>
-          <div className="actions">
-            <input value={date} onChange={(event) => setDate(event.target.value)} placeholder="YYYY-MM-DD" />
-            <button onClick={() => loadDashboard(date)} disabled={loading}><Search size={16} /> 查询</button>
-            <button onClick={() => trigger('preopen_pick')} disabled={!date || loading}><Play size={16} /> 选股</button>
-            <button onClick={() => trigger('simulate')} disabled={!date || loading}><ShieldCheck size={16} /> 模拟</button>
-          </div>
-        </header>
-
-        <section className="metrics">
-          <Metric label="推荐数" value={dashboard?.picks?.length ?? 0} />
-          <Metric label="最佳基因" value={String(best?.strategy_gene_id ?? '-')} />
-          <Metric label="市场环境" value={String(dashboard?.market_environment ?? '-')} />
-          <Metric label="财报覆盖" value={formatPct(Number(dashboard?.evidence_status?.coverage?.financial_actuals))} />
-        </section>
-
-        <section className="content-grid">
-          <Panel title="复盘摘要" icon={<ShieldCheck size={18} />}>
-            <ReviewSummary data={dashboard?.review_summary} />
-          </Panel>
-
-          <Panel title="今日推荐" icon={<Activity size={18} />}>
-            <PickList picks={dashboard?.picks ?? []} onSelectStock={(code) => loadStockReview(code)} />
-          </Panel>
-
-          <Panel title="策略表现" icon={<BrainCircuit size={18} />}>
-            <StrategyPerformance performance={dashboard?.performance ?? []} onSelect={(geneId) => loadStrategyReview(geneId)} />
-          </Panel>
-
-          <Panel title="单股复盘" icon={<Search size={18} />}>
-            <StockReviewPanel data={stockReview} />
-          </Panel>
-
-          <Panel title="早盘策略复盘" icon={<BrainCircuit size={18} />}>
-            <StrategyReviewPanel data={strategyReview} list={strategyReviews} onSelect={(geneId) => loadStrategyReview(geneId)} />
-          </Panel>
-
-          <Panel title="Challenger 对比" icon={<GitBranch size={18} />}>
-            <EvolutionPanel
-              comparisons={evolutionComparisons}
-              onDryRun={dryRunEvolution}
-              onApply={applyEvolutionProposal}
-              onPromote={promote}
-              onRollback={rollback}
-            />
-          </Panel>
-
-          <Panel title="LLM 复盘" icon={<BrainCircuit size={18} />}>
-            <LLMReviewPanel reviews={llmReviews} />
-          </Panel>
-
-          <Panel title="多维候选评分" icon={<GitBranch size={18} />}>
-            <CandidateScores candidate_scores={dashboard?.candidate_scores ?? []} />
-          </Panel>
-
-          <Panel title="数据质量" icon={<AlertTriangle size={18} />}>
-            {dashboard && <DataQuality dashboard={dashboard} />}
-          </Panel>
-
-          <Panel title="复盘证据覆盖" icon={<FileSearch size={18} />}>
-            <EvidenceCoverage status={dashboard?.evidence_status} />
-          </Panel>
-
-          <Panel title="记忆检索" icon={<Database size={18} />}>
-            <MemorySearch query={memoryQuery} onChange={setMemoryQuery} onSearch={searchMemory} results={memory} />
-          </Panel>
-        </section>
+        {view === 'dashboard' && <DashboardPage />}
+        {view === 'review' && <ReviewPage />}
+        {view === 'evolution' && <EvolutionPage />}
+        {view === 'data' && <DataMemoryPage />}
       </section>
     </main>
   );
 }
 
-function formatPct(value?: number) {
-  if (value === undefined || value === null || Number.isNaN(value)) return '-';
-  return `${(value * 100).toFixed(2)}%`;
-}
+/* === Model Switcher (sidebar) === */
 
-function diffParams(before: Record<string, unknown>, after: Record<string, unknown>) {
-  return Array.from(new Set([...Object.keys(before), ...Object.keys(after)]))
-    .filter((key) => before[key] !== after[key])
-    .sort()
-    .map((key) => ({ param: key, before: before[key], after: after[key] }));
+function ModelSwitcher() {
+  const [config, setConfig] = useState<{ model: string; available: Array<{ key: string; model: string; label: string }> } | null>(null);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/config`).then(r => r.json()).then((d) => {
+      setConfig({ model: d.model, available: d.available_models ?? [] });
+    }).catch(() => {});
+  }, []);
+
+  if (!config || config.available.length < 2) return null;
+
+  return (
+    <div className="model-switcher">
+      {config.available.map((m) => (
+        <button
+          key={m.key}
+          className={`model-btn ${config.model === m.model ? 'active' : ''}`}
+          onClick={() => {
+            fetch(`${API_BASE}/api/config/model`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model: m.model }),
+            }).then(r => r.json()).then(() => {
+              setConfig((prev) => prev ? { ...prev, model: m.model } : prev);
+            }).catch(() => {});
+          }}
+        >
+          {m.label.replace('DeepSeek ', '')}
+        </button>
+      ))}
+    </div>
+  );
 }

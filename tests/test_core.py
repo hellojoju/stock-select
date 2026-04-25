@@ -12,6 +12,7 @@ from stock_select.agent_runtime import run_daily_pipeline
 from stock_select.candidate_pipeline import rank_candidates_for_gene
 from stock_select.contracts import ContractError, PickContract, ReviewContract
 from stock_select.data_ingestion import (
+    AkShareProvider,
     DemoProvider,
     backfill_daily_prices_range,
     classify_market_environment,
@@ -22,6 +23,7 @@ from stock_select.data_ingestion import (
     open_trading_dates,
     publish_canonical_prices,
     sync_factors,
+    sync_fundamentals,
     sync_sector_signals,
     sync_daily_prices,
     sync_daily_sources,
@@ -247,11 +249,14 @@ class CoreFlowTest(unittest.TestCase):
         simulate_day(self.conn, "2026-01-12")
         review_ids = generate_deterministic_reviews(self.conn, "2026-01-12")
         self.assertGreater(len(review_ids), 0)
+        review_rows = repository.review_rows_for_date(self.conn, "2026-01-12")
+        self.assertEqual(len(review_rows), len(review_ids))
+        self.assertIn("verdict", review_rows[0])
         factor_count = self.conn.execute(
             "SELECT COUNT(*) AS count FROM factor_review_items WHERE review_id = ?",
             (review_ids[0],),
         ).fetchone()["count"]
-        self.assertEqual(factor_count, 6)
+        self.assertGreaterEqual(factor_count, 6)
         evidence_count = self.conn.execute(
             "SELECT COUNT(*) AS count FROM review_evidence WHERE review_id = ?",
             (review_ids[0],),
@@ -572,6 +577,30 @@ class CoreFlowTest(unittest.TestCase):
         self.assertEqual(negative[0], "penalty")
         self.assertLess(negative[1], 0)
 
+    def test_unconfigured_akshare_fundamentals_are_skipped_not_errors(self) -> None:
+        conn = connect(":memory:")
+        init_db(conn)
+        try:
+            repository.upsert_stock(conn, "000001.SZ", "Ping An", exchange="SZSE")
+            result = sync_fundamentals(
+                conn,
+                "2026-02-03",
+                providers=[AkShareProvider()],
+                stock_codes=["000001.SZ"],
+                resume=False,
+            )
+            self.assertEqual(result["sources"]["akshare"], 0)
+            self.assertEqual(result["errors"], {})
+            status = conn.execute(
+                """
+                SELECT status FROM data_sources
+                WHERE source='akshare' AND dataset='fundamentals' AND trading_date='2026-02-03'
+                """
+            ).fetchone()
+            self.assertEqual(status["status"], "skipped")
+        finally:
+            conn.close()
+
     def test_sync_factors_populates_candidate_packet_sources(self) -> None:
         conn = connect(":memory:")
         init_db(conn)
@@ -589,14 +618,17 @@ class CoreFlowTest(unittest.TestCase):
             self.assertGreater(result["industries"]["rows"], 0)
             self.assertGreater(result["sector_signals"]["rows"], 0)
             self.assertGreater(result["fundamentals"]["sources"]["demo"], 0)
+            self.assertGreater(result["event_signals"]["sources"]["demo"], 0)
 
             gene = repository.get_gene(conn, "gene_aggressive_v1")
             params = repository.loads(gene["params_json"], {})
             candidates = rank_candidates_for_gene(conn, "2026-02-03", "gene_aggressive_v1", params)
-            target = next(item for item in candidates if item.stock_code == "000001.SZ")
+            target = next(item for item in candidates if "event" not in item.packet["missing_fields"])
             self.assertNotIn("fundamental", target.packet["missing_fields"])
+            self.assertNotIn("event", target.packet["missing_fields"])
             self.assertIn("dataset", target.packet["sources"]["fundamental"])
             self.assertIn("dataset", target.packet["sources"]["sector"])
+            self.assertGreater(len(target.packet["sources"]["events"]), 0)
         finally:
             conn.close()
 

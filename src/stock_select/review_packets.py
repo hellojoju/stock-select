@@ -112,40 +112,28 @@ def decision_review_detail(conn: sqlite3.Connection, review_id: str) -> dict[str
 
 
 def domain_facts(conn: sqlite3.Connection, stock_code: str, trading_date: str) -> dict[str, list[dict[str, Any]]]:
+    financial = repository.latest_financial_actuals_before(conn, stock_code, trading_date)
     return {
         "earnings_surprises": repository.rows_to_dicts(
-            conn.execute(
-                "SELECT * FROM earnings_surprises WHERE stock_code = ? AND ann_date <= ? ORDER BY ann_date DESC",
-                (stock_code, trading_date),
-            )
+            repository.latest_earnings_surprises_before(conn, stock_code, trading_date)
         ),
         "financial_actuals": repository.rows_to_dicts(
-            conn.execute(
-                "SELECT * FROM financial_actuals WHERE stock_code = ? AND ann_date <= ? ORDER BY ann_date DESC",
-                (stock_code, trading_date),
-            )
+            [financial] if financial is not None else []
+        ),
+        "analyst_expectations": repository.rows_to_dicts(
+            repository.latest_expectations_before(conn, stock_code, trading_date)
         ),
         "order_contract_events": repository.rows_to_dicts(
-            conn.execute(
-                "SELECT * FROM order_contract_events WHERE stock_code = ? AND ann_date <= ? ORDER BY ann_date DESC",
-                (stock_code, trading_date),
-            )
+            repository.recent_order_contract_events_before(conn, stock_code, trading_date)
         ),
         "business_kpi_actuals": repository.rows_to_dicts(
-            conn.execute(
-                "SELECT * FROM business_kpi_actuals WHERE stock_code = ? ORDER BY period DESC",
-                (stock_code,),
-            )
+            repository.recent_business_kpis_before(conn, stock_code, trading_date)
         ),
         "risk_events": repository.rows_to_dicts(
-            conn.execute(
-                "SELECT * FROM event_signals WHERE stock_code = ? AND event_type IN ('risk', 'penalty', 'investigation') AND trading_date <= ? ORDER BY published_at DESC",
-                (stock_code, trading_date),
-            )
+            repository.recent_risk_events_before(conn, stock_code, trading_date)
         ),
     }
 
 
 def mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
-
