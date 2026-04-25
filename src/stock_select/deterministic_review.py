@@ -114,6 +114,18 @@ def review_decision(conn: sqlite3.Connection, decision_id: str) -> str:
                 evidence_ids=item["evidence_ids"],
             )
             maybe_signal_from_error(conn, row, review_id, item)
+
+    for missing_field in packet.get("missing_fields", []):
+        upsert_review_error(
+            conn,
+            review_scope="decision",
+            review_id=review_id,
+            error_type="data_missing",
+            severity=0.3,
+            confidence=0.9,
+            evidence_ids=evidence_ids[:1],
+        )
+
     return review_id
 
 
