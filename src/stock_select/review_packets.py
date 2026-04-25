@@ -137,6 +137,12 @@ def domain_facts(conn: sqlite3.Connection, stock_code: str, trading_date: str) -
                 (stock_code,),
             )
         ),
+        "risk_events": repository.rows_to_dicts(
+            conn.execute(
+                "SELECT * FROM event_signals WHERE stock_code = ? AND event_type IN ('risk', 'penalty', 'investigation') AND trading_date <= ? ORDER BY published_at DESC",
+                (stock_code, trading_date),
+            )
+        ),
     }
 
 
