@@ -372,6 +372,56 @@ meter {
   font-size: 12px;
 }
 
+.evidence-coverage-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.evidence-coverage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.evidence-coverage-cell {
+  border: 1px solid rgba(23, 18, 15, 0.16);
+  background: #fffdf7;
+  padding: 10px;
+  min-width: 0;
+}
+
+.evidence-coverage-cell span,
+.evidence-coverage-cell b,
+.evidence-coverage-cell small {
+  display: block;
+}
+
+.evidence-coverage-cell span,
+.evidence-coverage-cell small {
+  color: var(--muted);
+}
+
+.evidence-coverage-cell b {
+  font-size: 20px;
+  margin: 4px 0;
+}
+
+.evidence-warning {
+  display: grid;
+  gap: 4px;
+  border-left: 4px solid var(--gold);
+  background: #fffdf7;
+  padding: 10px;
+}
+
+.evidence-warning.danger {
+  border-color: var(--red);
+}
+
+.evidence-warning span {
+  color: var(--muted);
+}
+
 .score-bars {
   display: grid;
   gap: 7px;
@@ -461,6 +511,20 @@ meter {
   gap: 8px;
 }
 
+.evidence-group {
+  display: grid;
+  gap: 7px;
+  border: 1px solid rgba(23, 18, 15, 0.16);
+  background: #fffdf7;
+  padding: 10px;
+}
+
+.evidence-group h4 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--accent);
+}
+
 .evidence-table div {
   display: grid;
   grid-template-columns: 94px 86px 1fr;
@@ -471,6 +535,57 @@ meter {
 }
 
 .evidence-table small {
+  color: var(--muted);
+}
+
+.missing-evidence {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.evidence-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.evidence-strip span {
+  border: 1px solid rgba(23, 18, 15, 0.16);
+  background: #fffdf7;
+  padding: 6px 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.evidence-strip b {
+  color: var(--ink);
+}
+
+.evolution-card {
+  gap: 10px;
+}
+
+.evolution-perf {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.evolution-perf div {
+  border: 1px solid rgba(23, 18, 15, 0.16);
+  background: #fffaf0;
+  padding: 10px;
+}
+
+.evolution-perf span,
+.evolution-perf b,
+.evolution-perf small {
+  display: block;
+}
+
+.evolution-perf span,
+.evolution-perf small {
   color: var(--muted);
 }
 
@@ -556,4 +671,44 @@ meter {
     grid-template-columns: 1fr;
     gap: 3px;
   }
+
+  .evidence-coverage-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .evolution-perf {
+    grid-template-columns: 1fr;
+  }
 }
+
+/* LLM Review Panel */
+.llm-review-card {
+  border: 1px solid var(--border, #25201c);
+  border-radius: 8px;
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+.llm-review-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px; cursor: pointer; background: var(--surface-2, #e9e0d0);
+}
+.llm-review-header:hover { background: var(--surface-3, #ddd4c0); }
+.llm-review-body { padding: 14px; }
+.llm-summary { font-style: italic; color: var(--text-secondary, #706961); }
+.attribution-table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+.attribution-table th, .attribution-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border, #25201c); }
+.confidence-badge.EXTRACTED { color: #22c55e; font-weight: 600; }
+.confidence-badge.INFERRED { color: #eab308; font-weight: 600; }
+.confidence-badge.AMBIGUOUS { color: #ef4444; font-weight: 600; }
+.signal-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border, #25201c); }
+.signal-actions { display: flex; gap: 6px; }
+.btn-accept { background: #22c55e; color: white; border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+.btn-reject { background: #ef4444; color: white; border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+.btn-accept:hover { opacity: 0.8; }
+.btn-reject:hover { opacity: 0.8; }
+.token-usage { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border, #25201c); color: var(--text-secondary, #706961); }
+.llm-badge.candidate { background: #eab308; color: #000; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+.llm-badge.accepted { background: #22c55e; color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+.accepted-label { color: #22c55e; font-weight: 600; font-size: 12px; }
+.rejected-label { color: #ef4444; font-weight: 600; font-size: 12px; }
+.empty-state { color: var(--muted); font-style: italic; }

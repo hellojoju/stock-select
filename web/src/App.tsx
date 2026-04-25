@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Activity, AlertTriangle, BrainCircuit, Database, GitBranch, Play, Search, ShieldCheck } from 'lucide-react';
+import { Activity, AlertTriangle, BrainCircuit, Database, FileSearch, GitBranch, Play, Search, ShieldCheck } from 'lucide-react';
 import Metric from './components/Metric';
 import Panel from './components/Panel';
 import ReviewSummary from './sections/ReviewSummary';
@@ -9,8 +9,11 @@ import StockReviewPanel from './sections/StockReviewPanel';
 import StrategyReviewPanel from './sections/StrategyReviewPanel';
 import CandidateScores from './sections/CandidateScores';
 import DataQuality from './sections/DataQuality';
+import EvidenceCoverage from './sections/EvidenceCoverage';
+import EvolutionPanel from './sections/EvolutionPanel';
+import LLMReviewPanel from './sections/LLMReviewPanel';
 import MemorySearch from './sections/MemorySearch';
-import type { Dashboard, Pick } from './types';
+import type { Comparison, Dashboard, LLMReview, Pick } from './types';
 import './styles.css';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000';
@@ -23,6 +26,8 @@ export default function App() {
   const [stockReview, setStockReview] = useState<Record<string, unknown> | null>(null);
   const [strategyReviews, setStrategyReviews] = useState<Array<Record<string, unknown>>>([]);
   const [strategyReview, setStrategyReview] = useState<Record<string, unknown> | null>(null);
+  const [evolutionComparisons, setEvolutionComparisons] = useState<Comparison[]>([]);
+  const [llmReviews, setLlmReviews] = useState<LLMReview[]>([]);
   const [loading, setLoading] = useState(false);
 
   async function loadDashboard(targetDate = date) {
@@ -33,6 +38,8 @@ export default function App() {
     setDashboard(json);
     if (!date && json.date) setDate(json.date);
     if (json.date) void loadStrategyReviews(json.date);
+    if (json.date) void loadEvolutionComparisons(json.date);
+    if (json.date) void loadLlmReviews(json.date);
     setLoading(false);
   }
 
@@ -64,6 +71,64 @@ export default function App() {
     if (!targetDate) return;
     const response = await fetch(`${API_BASE}/api/reviews/preopen-strategies/${geneId}?date=${targetDate}`);
     setStrategyReview(await response.json());
+  }
+
+  async function loadEvolutionComparisons(targetDate = date) {
+    if (!targetDate) return;
+    const response = await fetch(`${API_BASE}/api/evolution/comparison?start=${targetDate}&end=${targetDate}`);
+    const json = await response.json();
+    setEvolutionComparisons(json.comparisons ?? []);
+  }
+
+  async function dryRunEvolution() {
+    if (!date) return;
+    setLoading(true);
+    const response = await fetch(`${API_BASE}/api/evolution/propose?start=${date}&end=${date}&dry_run=true`, { method: 'POST' });
+    const json = await response.json();
+    const dryRunComparisons = (json.proposals ?? []).map((proposal: Record<string, unknown>) => ({
+      event_id: proposal.event_id,
+      parent_gene_id: proposal.parent_gene_id,
+      child_gene_id: proposal.child_gene_id,
+      status: 'dry_run',
+      parent_performance: proposal.review_signal,
+      child_performance: null,
+      parameter_diff: diffParams(
+        (proposal.before_params ?? {}) as Record<string, unknown>,
+        (proposal.after_params ?? {}) as Record<string, unknown>,
+      ),
+      aggregated_signals: proposal.aggregated_signals,
+      promotion_eligible: false,
+    }));
+    setEvolutionComparisons(dryRunComparisons);
+    setLoading(false);
+  }
+
+  async function applyEvolutionProposal() {
+    if (!date) return;
+    setLoading(true);
+    await fetch(`${API_BASE}/api/evolution/propose?start=${date}&end=${date}`, { method: 'POST' });
+    await loadEvolutionComparisons(date);
+    setLoading(false);
+  }
+
+  async function loadLlmReviews(targetDate = date) {
+    if (!targetDate) return;
+    const response = await fetch(`${API_BASE}/api/reviews/llm?date=${targetDate}`);
+    setLlmReviews(await response.json());
+  }
+
+  async function promote(childGeneId: string) {
+    setLoading(true);
+    await fetch(`${API_BASE}/api/evolution/promote?child_gene_id=${encodeURIComponent(childGeneId)}`, { method: 'POST' });
+    await loadEvolutionComparisons(date);
+    setLoading(false);
+  }
+
+  async function rollback(childGeneId: string) {
+    setLoading(true);
+    await fetch(`${API_BASE}/api/evolution/rollback?child_gene_id=${encodeURIComponent(childGeneId)}`, { method: 'POST' });
+    await loadEvolutionComparisons(date);
+    setLoading(false);
   }
 
   useEffect(() => {
@@ -113,7 +178,7 @@ export default function App() {
           <Metric label="推荐数" value={dashboard?.picks?.length ?? 0} />
           <Metric label="最佳基因" value={String(best?.strategy_gene_id ?? '-')} />
           <Metric label="市场环境" value={String(dashboard?.market_environment ?? '-')} />
-          <Metric label="数据覆盖" value={formatPct(Number(dashboard?.data_quality_summary?.coverage_pct))} />
+          <Metric label="财报覆盖" value={formatPct(Number(dashboard?.evidence_status?.coverage?.financial_actuals))} />
         </section>
 
         <section className="content-grid">
@@ -137,12 +202,30 @@ export default function App() {
             <StrategyReviewPanel data={strategyReview} list={strategyReviews} onSelect={(geneId) => loadStrategyReview(geneId)} />
           </Panel>
 
+          <Panel title="Challenger 对比" icon={<GitBranch size={18} />}>
+            <EvolutionPanel
+              comparisons={evolutionComparisons}
+              onDryRun={dryRunEvolution}
+              onApply={applyEvolutionProposal}
+              onPromote={promote}
+              onRollback={rollback}
+            />
+          </Panel>
+
+          <Panel title="LLM 复盘" icon={<BrainCircuit size={18} />}>
+            <LLMReviewPanel reviews={llmReviews} />
+          </Panel>
+
           <Panel title="多维候选评分" icon={<GitBranch size={18} />}>
             <CandidateScores candidate_scores={dashboard?.candidate_scores ?? []} />
           </Panel>
 
           <Panel title="数据质量" icon={<AlertTriangle size={18} />}>
             {dashboard && <DataQuality dashboard={dashboard} />}
+          </Panel>
+
+          <Panel title="复盘证据覆盖" icon={<FileSearch size={18} />}>
+            <EvidenceCoverage status={dashboard?.evidence_status} />
           </Panel>
 
           <Panel title="记忆检索" icon={<Database size={18} />}>
@@ -157,4 +240,11 @@ export default function App() {
 function formatPct(value?: number) {
   if (value === undefined || value === null || Number.isNaN(value)) return '-';
   return `${(value * 100).toFixed(2)}%`;
+}
+
+function diffParams(before: Record<string, unknown>, after: Record<string, unknown>) {
+  return Array.from(new Set([...Object.keys(before), ...Object.keys(after)]))
+    .filter((key) => before[key] !== after[key])
+    .sort()
+    .map((key) => ({ param: key, before: before[key], after: after[key] }));
 }
