@@ -1,0 +1,778 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from datetime import date
+from typing import Any
+
+from . import repository
+from .optimization_signals import aggregate_optimization_signals, consume_signals
+
+
+MIN_TRADES_TO_EVOLVE = 20
+COMPONENT_PARAM_KEYS = {
+    "technical": "technical_component_weight",
+    "fundamental": "fundamental_component_weight",
+    "event": "event_component_weight",
+    "sector": "sector_component_weight",
+}
+COMPONENT_SCORE_KEYS = {
+    "technical": "technical_score",
+    "fundamental": "fundamental_score",
+    "event": "event_score",
+    "sector": "sector_score",
+}
+
+
+def score_genes(
+    conn: sqlite3.Connection,
+    *,
+    period_start: str,
+    period_end: str,
+    market_environment: str = "all",
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+          p.strategy_gene_id AS gene_id,
+          COUNT(o.outcome_id) AS trades,
+          AVG(o.return_pct) AS avg_return_pct,
+          SUM(CASE WHEN o.return_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(o.outcome_id) AS win_rate,
+          MIN(o.max_drawdown_intraday_pct) AS worst_drawdown_pct,
+          AVG(CASE WHEN o.return_pct > 0 THEN o.return_pct ELSE NULL END) AS avg_win,
+          ABS(AVG(CASE WHEN o.return_pct <= 0 THEN o.return_pct ELSE NULL END)) AS avg_loss
+        FROM outcomes o
+        JOIN pick_decisions p ON p.decision_id = o.decision_id
+        WHERE p.trading_date BETWEEN ? AND ?
+        GROUP BY p.strategy_gene_id
+        """,
+        (period_start, period_end),
+    ).fetchall()
+    scored: list[dict[str, Any]] = []
+    for row in rows:
+        blindspot_penalty = blindspot_penalty_for_gene(conn, row["gene_id"], period_start, period_end)
+        avg_loss = float(row["avg_loss"] or 0)
+        profit_loss_ratio = float(row["avg_win"] or 0) / avg_loss if avg_loss else float(row["avg_win"] or 0)
+        score = (
+            float(row["avg_return_pct"] or 0)
+            + float(row["win_rate"] or 0) * 0.02
+            + float(row["worst_drawdown_pct"] or 0) * 0.5
+            + min(profit_loss_ratio, 5.0) * 0.005
+            - blindspot_penalty
+        )
+        item = {
+            "gene_id": row["gene_id"],
+            "trades": int(row["trades"]),
+            "avg_return_pct": float(row["avg_return_pct"] or 0),
+            "win_rate": float(row["win_rate"] or 0),
+            "worst_drawdown_pct": float(row["worst_drawdown_pct"] or 0),
+            "profit_loss_ratio": profit_loss_ratio,
+            "blindspot_penalty": blindspot_penalty,
+            "score": score,
+        }
+        persist_gene_score(conn, item, period_start, period_end, market_environment)
+        scored.append(item)
+    conn.commit()
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    return scored
+
+
+def evolve_weekly(
+    conn: sqlite3.Connection,
+    *,
+    period_start: str,
+    period_end: str,
+    market_environment: str = "all",
+    min_trades: int = MIN_TRADES_TO_EVOLVE,
+) -> dict[str, Any]:
+    scored = score_genes(
+        conn,
+        period_start=period_start,
+        period_end=period_end,
+        market_environment=market_environment,
+    )
+    proposal_result = propose_strategy_evolution(
+        conn,
+        period_start=period_start,
+        period_end=period_end,
+        market_environment=market_environment,
+        min_trades=min_trades,
+    )
+    proposal_result["scores"] = scored
+    return proposal_result
+
+
+def propose_strategy_evolution(
+    conn: sqlite3.Connection,
+    *,
+    period_start: str,
+    period_end: str,
+    market_environment: str = "all",
+    min_trades: int = MIN_TRADES_TO_EVOLVE,
+    min_signal_samples: int = 5,
+    min_signal_confidence: float = 0.65,
+    min_signal_dates: int = 3,
+    gene_id: str | None = None,
+) -> dict[str, Any]:
+    proposals: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    champions = repository.get_champion_genes(conn)
+    if gene_id:
+        champions = [row for row in champions if row["gene_id"] == gene_id]
+
+    for parent in champions:
+        parent_gene_id = parent["gene_id"]
+        signal = build_review_signal(
+            conn,
+            parent_gene_id,
+            period_start=period_start,
+            period_end=period_end,
+        )
+        if signal["trades"] < min_trades:
+            skipped.append(
+                {
+                    "gene_id": parent_gene_id,
+                    "reason": "insufficient samples",
+                    "trades": signal["trades"],
+                    "min_trades": min_trades,
+                }
+            )
+            continue
+
+        before_params = json.loads(parent["params_json"])
+        aggregated_signals = aggregate_optimization_signals(
+            conn,
+            gene_id=parent_gene_id,
+            period_start=period_start,
+            period_end=period_end,
+            min_signal_samples=min_signal_samples,
+            min_confidence=min_signal_confidence,
+            min_distinct_dates=min_signal_dates,
+        )
+        if not aggregated_signals:
+            skipped.append(
+                {
+                    "gene_id": parent_gene_id,
+                    "reason": "insufficient optimization signals",
+                    "trades": signal["trades"],
+                }
+            )
+            continue
+
+        after_params, rationale = propose_params_from_optimization_signals(before_params, aggregated_signals)
+        if not params_changed(before_params, after_params):
+            skipped.append({"gene_id": parent_gene_id, "reason": "no material review signal"})
+            continue
+
+        child_gene_id = create_observing_child_gene(
+            conn,
+            parent,
+            period_start=period_start,
+            period_end=period_end,
+            params=after_params,
+        )
+        event_id = persist_evolution_event(
+            conn,
+            parent_gene_id=parent_gene_id,
+            child_gene_id=child_gene_id,
+            event_type="proposal",
+            period_start=period_start,
+            period_end=period_end,
+            market_environment=market_environment,
+            status="applied",
+            rationale=rationale,
+            before_params=before_params,
+            after_params=after_params,
+            review_signal={"review_signal": signal, "aggregated_signals": aggregated_signals},
+        )
+        consume_signals(conn, sorted({signal_id for item in aggregated_signals for signal_id in item["signal_ids"]}))
+        child = repository.get_gene(conn, child_gene_id)
+        proposals.append(
+            {
+                "event_id": event_id,
+                "parent_gene_id": parent_gene_id,
+                "child_gene_id": child_gene_id,
+                "child_status": child["status"],
+                "rationale": rationale,
+                "review_signal": signal,
+                "aggregated_signals": aggregated_signals,
+            }
+        )
+    conn.commit()
+    if not proposals:
+        reason = "insufficient samples" if skipped else "no active champions"
+        return {"status": "skipped", "reason": reason, "proposals": [], "skipped": skipped}
+    return {
+        "status": "proposed",
+        "proposals": proposals,
+        "skipped": skipped,
+    }
+
+
+def propose_params_from_optimization_signals(
+    before_params: dict[str, Any],
+    aggregated_signals: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    after = dict(before_params)
+    adjustments: list[dict[str, Any]] = []
+    for signal in aggregated_signals:
+        param_name = signal.get("param_name")
+        if not param_name or param_name not in after or not isinstance(after[param_name], (int, float)):
+            continue
+        direction = signal["direction"]
+        signal_type = signal["signal_type"]
+        strength = float(signal["weighted_strength"])
+        factor = 1.0
+        if signal_type in {"increase_weight", "lower_threshold", "adjust_position", "adjust_sell_rule"} and direction in {"up", "down"}:
+            factor = 1.0 + min(0.05, strength * 0.05) if direction == "up" else 1.0 - min(0.05, strength * 0.05)
+        elif signal_type in {"decrease_weight", "raise_threshold"} and direction in {"up", "down"}:
+            factor = 1.0 - min(0.05, strength * 0.05) if direction == "down" else 1.0 + min(0.05, strength * 0.05)
+        before = float(after[param_name])
+        after[param_name] = round(before * factor, 6)
+        adjustments.append(
+            {
+                "param": param_name,
+                "before": before,
+                "after": after[param_name],
+                "factor": round(factor, 6),
+                "source": signal,
+            }
+        )
+    normalize_component_budget(after, before_params)
+    round_tunable_params(after)
+    return after, {
+        "method": "optimization_signal_parameter_adjustment",
+        "guardrails": [
+            "parent remains active",
+            "child starts in observing status",
+            "signals are marked consumed after proposal",
+            "single parameter movement is capped at 5%",
+        ],
+        "adjustments": adjustments,
+    }
+
+
+def create_observing_child_gene(
+    conn: sqlite3.Connection,
+    parent: sqlite3.Row,
+    *,
+    period_start: str,
+    period_end: str,
+    params: dict[str, Any],
+) -> str:
+    suffix = hashlib.sha1(
+        repository.dumps(
+            {
+                "parent": parent["gene_id"],
+                "period_start": period_start,
+                "period_end": period_end,
+                "params": params,
+            }
+        ).encode("utf-8")
+    ).hexdigest()[:8]
+    new_gene_id = f"{parent['gene_id']}_challenger_{suffix}"
+    version = next_gene_version(conn, parent["gene_id"])
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO strategy_genes(
+          gene_id, name, version, horizon, risk_profile, status,
+          parent_gene_id, params_json
+        )
+        VALUES (?, ?, ?, ?, ?, 'observing', ?, ?)
+        """,
+        (
+            new_gene_id,
+            f"{parent['name']} challenger {period_end}",
+            version,
+            parent["horizon"],
+            parent["risk_profile"],
+            parent["gene_id"],
+            repository.dumps(params),
+        ),
+    )
+    return new_gene_id
+
+
+def build_review_signal(
+    conn: sqlite3.Connection,
+    gene_id: str,
+    *,
+    period_start: str,
+    period_end: str,
+) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT
+          p.trading_date,
+          p.stock_code,
+          o.return_pct,
+          o.max_drawdown_intraday_pct,
+          c.technical_score,
+          c.fundamental_score,
+          c.event_score,
+          c.sector_score,
+          c.risk_penalty
+        FROM pick_decisions p
+        JOIN outcomes o ON o.decision_id = p.decision_id
+        LEFT JOIN candidate_scores c
+          ON c.trading_date = p.trading_date
+         AND c.strategy_gene_id = p.strategy_gene_id
+         AND c.stock_code = p.stock_code
+        WHERE p.strategy_gene_id = ?
+          AND p.trading_date BETWEEN ? AND ?
+        ORDER BY p.trading_date, p.stock_code
+        """,
+        (gene_id, period_start, period_end),
+    ).fetchall()
+    trades = len(rows)
+    returns = [float(row["return_pct"]) for row in rows]
+    winners = [row for row in rows if float(row["return_pct"]) > 0]
+    losers = [row for row in rows if float(row["return_pct"]) <= 0]
+    component_edges: dict[str, float] = {}
+    component_averages: dict[str, float] = {}
+    for component, score_key in COMPONENT_SCORE_KEYS.items():
+        all_avg = avg([row[score_key] for row in rows])
+        winner_avg = avg([row[score_key] for row in winners])
+        loser_avg = avg([row[score_key] for row in losers])
+        component_averages[component] = all_avg
+        component_edges[component] = winner_avg - loser_avg if losers else all_avg
+
+    blindspots = blindspots_for_gene(conn, gene_id, period_start, period_end)
+    missing_signals = missing_signals_for_gene(conn, gene_id, period_start, period_end)
+    worst_drawdown = min([float(row["max_drawdown_intraday_pct"]) for row in rows], default=0.0)
+    return {
+        "gene_id": gene_id,
+        "period_start": period_start,
+        "period_end": period_end,
+        "trades": trades,
+        "avg_return_pct": avg(returns),
+        "win_rate": len(winners) / trades if trades else 0.0,
+        "loss_rate": len(losers) / trades if trades else 0.0,
+        "worst_drawdown_pct": worst_drawdown,
+        "component_edges": component_edges,
+        "component_averages": component_averages,
+        "avg_risk_penalty": avg([row["risk_penalty"] for row in rows]),
+        "blindspot_count": len(blindspots),
+        "blindspot_avg_return_pct": avg([item["return_pct"] for item in blindspots]),
+        "missing_signals": missing_signals,
+    }
+
+
+def propose_params_from_reviews(
+    before_params: dict[str, Any],
+    signal: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    after = dict(before_params)
+    adjustments: list[dict[str, Any]] = []
+
+    if signal["win_rate"] >= 0.55 and signal["avg_return_pct"] > 0 and signal["worst_drawdown_pct"] > -0.06:
+        adjust_numeric(after, "position_pct", 1.05, 0.01, 0.2, adjustments, "reviews show positive expectancy")
+    elif signal["avg_return_pct"] < 0 or signal["win_rate"] < 0.45:
+        adjust_numeric(after, "position_pct", 0.9, 0.01, 0.2, adjustments, "reviews show weak expectancy")
+
+    for component, edge in signal["component_edges"].items():
+        key = COMPONENT_PARAM_KEYS[component]
+        if edge > 0.05:
+            adjust_numeric(after, key, 1.04, 0.02, 2.0, adjustments, f"{component} score separated winners")
+        elif edge < -0.05:
+            adjust_numeric(after, key, 0.96, 0.02, 2.0, adjustments, f"{component} score appeared in weak picks")
+
+    if signal["blindspot_count"] > 0:
+        adjust_numeric(after, "event_component_weight", 1.05, 0.02, 2.0, adjustments, "blindspot review suggests missed catalysts")
+        adjust_numeric(after, "sector_component_weight", 1.05, 0.02, 2.0, adjustments, "blindspot review suggests missed sector moves")
+
+    if signal["worst_drawdown_pct"] <= -0.04 or signal["loss_rate"] >= 0.4:
+        adjust_numeric(after, "risk_component_weight", 1.06, 0.02, 2.0, adjustments, "reviews show drawdown or loss clustering")
+
+    normalize_component_budget(after, before_params)
+    round_tunable_params(after)
+    rationale = {
+        "method": "review_signal_parameter_adjustment",
+        "guardrails": [
+            "parent remains active",
+            "child starts in observing status",
+            "component weights keep the parent budget",
+            "promotion or rollback is explicit",
+        ],
+        "adjustments": adjustments,
+    }
+    return after, rationale
+
+
+def rollback_evolution(
+    conn: sqlite3.Connection,
+    *,
+    child_gene_id: str | None = None,
+    event_id: str | None = None,
+    reason: str = "manual rollback",
+) -> dict[str, Any]:
+    event = find_proposal_event(conn, child_gene_id=child_gene_id, event_id=event_id)
+    conn.execute(
+        "UPDATE strategy_genes SET status = 'rolled_back', updated_at = CURRENT_TIMESTAMP WHERE gene_id = ?",
+        (event["child_gene_id"],),
+    )
+    conn.execute(
+        """
+        UPDATE strategy_evolution_events
+        SET status = 'rolled_back', rolled_back_at = CURRENT_TIMESTAMP
+        WHERE event_id = ?
+        """,
+        (event["event_id"],),
+    )
+    rollback_id = persist_evolution_event(
+        conn,
+        parent_gene_id=event["parent_gene_id"],
+        child_gene_id=event["child_gene_id"],
+        event_type="rollback",
+        period_start=event["period_start"],
+        period_end=event["period_end"],
+        market_environment=event["market_environment"],
+        status="applied",
+        rationale={"reason": reason, "rolled_back_event_id": event["event_id"]},
+        before_params=json.loads(event["after_params_json"] or event["before_params_json"]),
+        after_params=json.loads(event["before_params_json"]),
+        review_signal=json.loads(event["review_signal_json"]),
+    )
+    conn.commit()
+    return {
+        "status": "rolled_back",
+        "event_id": rollback_id,
+        "proposal_event_id": event["event_id"],
+        "child_gene_id": event["child_gene_id"],
+    }
+
+
+def promote_challenger(
+    conn: sqlite3.Connection,
+    *,
+    child_gene_id: str,
+    reason: str = "manual promotion",
+) -> dict[str, Any]:
+    event = find_proposal_event(conn, child_gene_id=child_gene_id)
+    child = repository.get_gene(conn, event["child_gene_id"])
+    if child["status"] == "rolled_back":
+        raise ValueError(f"Cannot promote rolled back gene: {child_gene_id}")
+    conn.execute(
+        "UPDATE strategy_genes SET status = 'retired', updated_at = CURRENT_TIMESTAMP WHERE gene_id = ?",
+        (event["parent_gene_id"],),
+    )
+    conn.execute(
+        "UPDATE strategy_genes SET status = 'active', updated_at = CURRENT_TIMESTAMP WHERE gene_id = ?",
+        (event["child_gene_id"],),
+    )
+    promotion_id = persist_evolution_event(
+        conn,
+        parent_gene_id=event["parent_gene_id"],
+        child_gene_id=event["child_gene_id"],
+        event_type="promotion",
+        period_start=event["period_start"],
+        period_end=event["period_end"],
+        market_environment=event["market_environment"],
+        status="applied",
+        rationale={"reason": reason, "proposal_event_id": event["event_id"]},
+        before_params=json.loads(event["before_params_json"]),
+        after_params=json.loads(event["after_params_json"] or event["before_params_json"]),
+        review_signal=json.loads(event["review_signal_json"]),
+    )
+    conn.commit()
+    return {
+        "status": "promoted",
+        "event_id": promotion_id,
+        "parent_gene_id": event["parent_gene_id"],
+        "child_gene_id": event["child_gene_id"],
+    }
+
+
+def blindspots_for_gene(
+    conn: sqlite3.Connection,
+    gene_id: str,
+    period_start: str,
+    period_end: str,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT stock_code, trading_date, rank, return_pct, missed_by_gene_ids_json, reason
+        FROM blindspot_reports
+        WHERE trading_date BETWEEN ? AND ?
+        ORDER BY trading_date, rank
+        """,
+        (period_start, period_end),
+    ).fetchall()
+    blindspots: list[dict[str, Any]] = []
+    for row in rows:
+        missed = json.loads(row["missed_by_gene_ids_json"])
+        if gene_id in missed:
+            blindspots.append(
+                {
+                    "stock_code": row["stock_code"],
+                    "trading_date": row["trading_date"],
+                    "rank": int(row["rank"]),
+                    "return_pct": float(row["return_pct"]),
+                    "reason": row["reason"],
+                }
+            )
+    return blindspots
+
+
+def missing_signals_for_gene(
+    conn: sqlite3.Connection,
+    gene_id: str,
+    period_start: str,
+    period_end: str,
+) -> dict[str, int]:
+    rows = conn.execute(
+        """
+        SELECT ambiguity_json FROM review_logs
+        WHERE strategy_gene_id = ?
+          AND trading_date BETWEEN ? AND ?
+        """,
+        (gene_id, period_start, period_end),
+    ).fetchall()
+    counts: dict[str, int] = {}
+    for row in rows:
+        for signal in json.loads(row["ambiguity_json"] or "[]"):
+            key = str(signal)
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def adjust_numeric(
+    params: dict[str, Any],
+    key: str,
+    factor: float,
+    lower: float,
+    upper: float,
+    adjustments: list[dict[str, Any]],
+    reason: str,
+) -> None:
+    if key not in params or not isinstance(params[key], (int, float)):
+        return
+    before = float(params[key])
+    after = min(max(before * factor, lower), upper)
+    if abs(after - before) < 1e-9:
+        return
+    params[key] = after
+    adjustments.append(
+        {
+            "param": key,
+            "before": before,
+            "after": after,
+            "factor": factor,
+            "reason": reason,
+        }
+    )
+
+
+def normalize_component_budget(after: dict[str, Any], before: dict[str, Any]) -> None:
+    keys = list(COMPONENT_PARAM_KEYS.values())
+    target = sum(float(before.get(key, 0)) for key in keys)
+    current = sum(float(after.get(key, 0)) for key in keys)
+    if target <= 0 or current <= 0:
+        return
+    ratio = target / current
+    for key in keys:
+        if isinstance(after.get(key), (int, float)):
+            after[key] = float(after[key]) * ratio
+
+
+def round_tunable_params(params: dict[str, Any]) -> None:
+    for key in [
+        "position_pct",
+        "technical_component_weight",
+        "fundamental_component_weight",
+        "event_component_weight",
+        "sector_component_weight",
+        "risk_component_weight",
+    ]:
+        if isinstance(params.get(key), (int, float)):
+            params[key] = round(float(params[key]), 6)
+
+
+def params_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    return repository.dumps(before) != repository.dumps(after)
+
+
+def next_gene_version(conn: sqlite3.Connection, parent_gene_id: str) -> int:
+    parent = repository.get_gene(conn, parent_gene_id)
+    row = conn.execute(
+        """
+        SELECT MAX(version) AS version
+        FROM strategy_genes
+        WHERE gene_id = ? OR parent_gene_id = ?
+        """,
+        (parent_gene_id, parent_gene_id),
+    ).fetchone()
+    return max(int(parent["version"]), int(row["version"] or 0)) + 1
+
+
+def persist_evolution_event(
+    conn: sqlite3.Connection,
+    *,
+    parent_gene_id: str,
+    child_gene_id: str | None,
+    event_type: str,
+    period_start: str,
+    period_end: str,
+    market_environment: str,
+    status: str,
+    rationale: dict[str, Any],
+    before_params: dict[str, Any],
+    after_params: dict[str, Any] | None,
+    review_signal: dict[str, Any],
+) -> str:
+    event_id = build_evolution_event_id(
+        parent_gene_id=parent_gene_id,
+        child_gene_id=child_gene_id,
+        event_type=event_type,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    conn.execute(
+        """
+        INSERT INTO strategy_evolution_events(
+          event_id, parent_gene_id, child_gene_id, event_type, period_start,
+          period_end, market_environment, status, rationale_json,
+          before_params_json, after_params_json, review_signal_json, applied_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(parent_gene_id, child_gene_id, event_type) DO UPDATE SET
+          status = excluded.status,
+          rationale_json = excluded.rationale_json,
+          before_params_json = excluded.before_params_json,
+          after_params_json = excluded.after_params_json,
+          review_signal_json = excluded.review_signal_json,
+          applied_at = excluded.applied_at
+        """,
+        (
+            event_id,
+            parent_gene_id,
+            child_gene_id,
+            event_type,
+            period_start,
+            period_end,
+            market_environment,
+            status,
+            repository.dumps(rationale),
+            repository.dumps(before_params),
+            repository.dumps(after_params) if after_params is not None else None,
+            repository.dumps(review_signal),
+        ),
+    )
+    return event_id
+
+
+def build_evolution_event_id(
+    *,
+    parent_gene_id: str,
+    child_gene_id: str | None,
+    event_type: str,
+    period_start: str,
+    period_end: str,
+) -> str:
+    raw = f"{parent_gene_id}:{child_gene_id}:{event_type}:{period_start}:{period_end}"
+    return "evo_" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:14]
+
+
+def find_proposal_event(
+    conn: sqlite3.Connection,
+    *,
+    child_gene_id: str | None = None,
+    event_id: str | None = None,
+) -> sqlite3.Row:
+    if event_id:
+        row = conn.execute(
+            """
+            SELECT * FROM strategy_evolution_events
+            WHERE event_id = ? AND event_type = 'proposal'
+            """,
+            (event_id,),
+        ).fetchone()
+    elif child_gene_id:
+        row = conn.execute(
+            """
+            SELECT * FROM strategy_evolution_events
+            WHERE child_gene_id = ? AND event_type = 'proposal'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (child_gene_id,),
+        ).fetchone()
+    else:
+        raise ValueError("child_gene_id or event_id is required")
+    if row is None:
+        raise KeyError("Evolution proposal event not found")
+    return row
+
+
+def avg(values: list[Any]) -> float:
+    numbers = [float(value) for value in values if value is not None]
+    if not numbers:
+        return 0.0
+    return sum(numbers) / len(numbers)
+
+
+def persist_gene_score(
+    conn: sqlite3.Connection,
+    item: dict[str, Any],
+    period_start: str,
+    period_end: str,
+    market_environment: str,
+) -> None:
+    score_id = "score_" + hashlib.sha1(
+        f"{item['gene_id']}:{period_start}:{period_end}:{market_environment}".encode("utf-8")
+    ).hexdigest()[:12]
+    conn.execute(
+        """
+        INSERT INTO gene_scores(
+          score_id, gene_id, period_start, period_end, market_environment,
+          trades, avg_return_pct, win_rate, worst_drawdown_pct,
+          profit_loss_ratio, blindspot_penalty, score
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(gene_id, period_start, period_end, market_environment)
+        DO UPDATE SET
+          trades = excluded.trades,
+          avg_return_pct = excluded.avg_return_pct,
+          win_rate = excluded.win_rate,
+          worst_drawdown_pct = excluded.worst_drawdown_pct,
+          profit_loss_ratio = excluded.profit_loss_ratio,
+          blindspot_penalty = excluded.blindspot_penalty,
+          score = excluded.score
+        """,
+        (
+            score_id,
+            item["gene_id"],
+            period_start,
+            period_end,
+            market_environment,
+            item["trades"],
+            item["avg_return_pct"],
+            item["win_rate"],
+            item["worst_drawdown_pct"],
+            item["profit_loss_ratio"],
+            item["blindspot_penalty"],
+            item["score"],
+        ),
+    )
+
+
+def blindspot_penalty_for_gene(conn: sqlite3.Connection, gene_id: str, period_start: str, period_end: str) -> float:
+    rows = conn.execute(
+        """
+        SELECT missed_by_gene_ids_json FROM blindspot_reports
+        WHERE trading_date BETWEEN ? AND ?
+        """,
+        (period_start, period_end),
+    ).fetchall()
+    misses = 0
+    for row in rows:
+        if gene_id in json.loads(row["missed_by_gene_ids_json"]):
+            misses += 1
+    return misses * 0.002
+
+
+def default_week_window(today: date | None = None) -> tuple[str, str]:
+    today = today or date.today()
+    start_ord = today.toordinal() - 6
+    return date.fromordinal(start_ord).isoformat(), today.isoformat()

@@ -1,0 +1,30 @@
+[project]
+name = "stock-select"
+version = "0.1.0"
+description = "Self-evolving A-share stock selection research system."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+stock-select = "stock_select.cli:main"
+
+[project.optional-dependencies]
+api = [
+  "fastapi>=0.115",
+  "pydantic>=2.8",
+  "uvicorn>=0.30",
+]
+data = [
+  "akshare>=1.16",
+  "baostock>=0.8",
+]
+scheduler = [
+  "apscheduler>=3.10",
+]
+graph = [
+  "networkx>=3.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

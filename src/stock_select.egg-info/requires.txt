@@ -1,0 +1,15 @@
+
+[api]
+fastapi>=0.115
+pydantic>=2.8
+uvicorn>=0.30
+
+[data]
+akshare>=1.16
+baostock>=0.8
+
+[graph]
+networkx>=3.3
+
+[scheduler]
+apscheduler>=3.10

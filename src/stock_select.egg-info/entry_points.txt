@@ -1,0 +1,2 @@
+[console_scripts]
+stock-select = stock_select.cli:main

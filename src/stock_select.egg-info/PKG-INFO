@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: stock-select
+Version: 0.1.0
+Summary: Self-evolving A-share stock selection research system.
+Requires-Python: >=3.11
+Provides-Extra: api
+Requires-Dist: fastapi>=0.115; extra == "api"
+Requires-Dist: pydantic>=2.8; extra == "api"
+Requires-Dist: uvicorn>=0.30; extra == "api"
+Provides-Extra: data
+Requires-Dist: akshare>=1.16; extra == "data"
+Requires-Dist: baostock>=0.8; extra == "data"
+Provides-Extra: scheduler
+Requires-Dist: apscheduler>=3.10; extra == "scheduler"
+Provides-Extra: graph
+Requires-Dist: networkx>=3.3; extra == "graph"
