@@ -25,13 +25,23 @@ from .data_ingestion import (
 )
 from .data_status import data_quality_rows, data_quality_summary, data_source_status
 from .deterministic_review import review_decision
-from .evolution import promote_challenger, propose_strategy_evolution, rollback_evolution
+from .evidence_sync import (
+    sync_analyst_expectations,
+    sync_business_kpi_actuals,
+    sync_earnings_surprises,
+    sync_evidence,
+    sync_financial_actuals,
+    sync_order_contract_events,
+    sync_risk_events,
+)
+from .evidence_views import evidence_status as evidence_status_payload, stock_evidence
+from .evolution import evolution_comparison, promote_challenger, propose_strategy_evolution, rollback_evolution
 from .factor_views import factor_status, sector_factors, stock_factors
 from .gene_review import get_preopen_strategy_review, list_preopen_strategy_reviews, review_gene
 from .graph import query_graph
 from .memory import search_memory
 from .optimization_signals import list_optimization_signals
-from .repository import latest_trading_date, rows_to_dicts
+from .repository import latest_trading_date, review_rows_for_date, rows_to_dicts
 from .review_packets import stock_review, stock_review_history
 from .runtime import resolve_runtime
 from .simulator import summarize_performance
@@ -81,6 +91,7 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
                 return runtime.as_payload() | {"date": None, "picks": [], "performance": [], "runs": []}
             quality_summary = data_quality_summary(conn, current_date)
             market = quality_summary.get("market_environment") or {}
+            evidence_summary = evidence_status_payload(conn, current_date)
             return runtime.as_payload() | {
                 "date": current_date,
                 "market_environment": market.get("market_environment") if isinstance(market, dict) else None,
@@ -112,6 +123,7 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
                 ),
                 "data_status": data_source_status(conn, current_date),
                 "data_quality_summary": quality_summary,
+                "evidence_status": evidence_summary,
                 "candidate_scores": rows_to_dicts(
                     conn.execute(
                         """
@@ -165,6 +177,22 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
         conn = db()
         try:
             return sector_factors(conn, date)
+        finally:
+            conn.close()
+
+    @app.get("/api/evidence/status")
+    def evidence_status_endpoint(date: str) -> dict[str, Any]:
+        conn = db()
+        try:
+            return evidence_status_payload(conn, date)
+        finally:
+            conn.close()
+
+    @app.get("/api/evidence/stocks/{stock_code}")
+    def stock_evidence_endpoint(stock_code: str, date: str) -> dict[str, Any]:
+        conn = db()
+        try:
+            return stock_evidence(conn, stock_code, date)
         finally:
             conn.close()
 
@@ -265,11 +293,40 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
         finally:
             conn.close()
 
+    @app.post("/api/optimization-signals/{signal_id}/accept")
+    def accept_optimization_signal(signal_id: str) -> dict[str, Any]:
+        conn = db()
+        try:
+            conn.execute(
+                "UPDATE optimization_signals SET status = 'open' WHERE signal_id = ? AND status = 'candidate'",
+                (signal_id,),
+            )
+            conn.commit()
+            if conn.total_changes == 0:
+                return {"status": "not_found_or_not_candidate"}
+            return {"status": "accepted"}
+        finally:
+            conn.close()
+
+    @app.post("/api/optimization-signals/{signal_id}/reject")
+    def reject_optimization_signal(signal_id: str) -> dict[str, Any]:
+        conn = db()
+        try:
+            conn.execute(
+                "UPDATE optimization_signals SET status = 'rejected' WHERE signal_id = ? AND status = 'candidate'",
+                (signal_id,),
+            )
+            conn.commit()
+            return {"status": "rejected"}
+        finally:
+            conn.close()
+
     @app.post("/api/evolution/propose")
     def propose_evolution(
         start: str,
         end: str,
         gene_id: str | None = None,
+        dry_run: bool = False,
         min_trades: int = 20,
         min_signal_samples: int = 5,
         min_signal_confidence: float = 0.65,
@@ -286,7 +343,16 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
                 min_signal_samples=min_signal_samples,
                 min_signal_confidence=min_signal_confidence,
                 min_signal_dates=min_signal_dates,
+                dry_run=dry_run,
             )
+        finally:
+            conn.close()
+
+    @app.get("/api/evolution/comparison")
+    def comparison(gene_id: str | None = None, start: str | None = None, end: str | None = None) -> dict[str, Any]:
+        conn = db()
+        try:
+            return evolution_comparison(conn, gene_id=gene_id, start=start, end=end)
         finally:
             conn.close()
 
@@ -354,7 +420,7 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
     def reviews(date: str) -> list[dict[str, Any]]:
         conn = db()
         try:
-            return rows_to_dicts(conn.execute("SELECT * FROM review_logs WHERE trading_date = ?", (date,)))
+            return review_rows_for_date(conn, date)
         finally:
             conn.close()
 
@@ -634,6 +700,76 @@ def run_data_sync(
         )
     if dataset == "factors":
         return sync_factors(conn, date, providers=providers_for_source(source), stock_limit=limit)
+    if dataset == "financial_actuals":
+        return sync_financial_actuals(
+            conn,
+            date,
+            providers=providers_for_source(source),
+            limit=limit,
+            offset=offset,
+            batch_size=batch_size,
+            resume=resume,
+            throttle_seconds=throttle_seconds,
+        )
+    if dataset == "analyst_expectations":
+        return sync_analyst_expectations(
+            conn,
+            date,
+            providers=providers_for_source(source),
+            limit=limit,
+            offset=offset,
+            batch_size=batch_size,
+            resume=resume,
+            throttle_seconds=throttle_seconds,
+        )
+    if dataset == "earnings_surprises":
+        return sync_earnings_surprises(conn, date)
+    if dataset == "order_contract_events":
+        return sync_order_contract_events(
+            conn,
+            date,
+            date,
+            providers=providers_for_source(source),
+            limit=limit,
+            offset=offset,
+            batch_size=batch_size,
+            resume=resume,
+            throttle_seconds=throttle_seconds,
+        )
+    if dataset == "business_kpi_actuals":
+        return sync_business_kpi_actuals(
+            conn,
+            date,
+            providers=providers_for_source(source),
+            limit=limit,
+            offset=offset,
+            batch_size=batch_size,
+            resume=resume,
+            throttle_seconds=throttle_seconds,
+        )
+    if dataset == "risk_events":
+        return sync_risk_events(
+            conn,
+            date,
+            date,
+            providers=providers_for_source(source),
+            limit=limit,
+            offset=offset,
+            batch_size=batch_size,
+            resume=resume,
+            throttle_seconds=throttle_seconds,
+        )
+    if dataset == "evidence":
+        return sync_evidence(
+            conn,
+            date,
+            providers=providers_for_source(source),
+            limit=limit,
+            offset=offset,
+            batch_size=batch_size,
+            resume=resume,
+            throttle_seconds=throttle_seconds,
+        )
     raise ValueError(f"Unknown dataset: {dataset}")
 
 
