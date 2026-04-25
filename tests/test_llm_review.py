@@ -11,7 +11,8 @@ from stock_select.db import connect, init_db
 from stock_select.seed import seed_demo_data
 from stock_select.llm_contracts import LLMReviewContract, AttributionClaim, LLMContractError
 from stock_select.llm_prompt import build_decision_review_packet, build_system_prompt, build_user_prompt
-from stock_select.llm_review import llm_review_for_decision, review_decision, run_llm_review
+from stock_select.llm_review import llm_review_for_decision, review_decision, run_llm_review, _persist_llm_review
+from stock_select.optimization_signals import list_optimization_signals
 
 
 @pytest.fixture()
@@ -182,3 +183,28 @@ class TestLLMReviewExtensions:
                 "reason_check": {},
                 "summary": "",
             })
+
+
+class TestLLMSignalStaging:
+    def test_llm_signal_status_is_candidate(self, picked_db):
+        """LLM-generated signals should default to 'candidate', not 'open'."""
+        contract = LLMReviewContract.validate({
+            "review_target": {"type": "decision", "id": "pick_llm_test"},
+            "attribution": [],
+            "reason_check": {},
+            "suggested_optimization_signals": [
+                {"signal_type": "increase_weight", "param_name": "momentum_weight",
+                 "direction": "up", "strength": 0.1, "reason": "test"}
+            ],
+            "summary": "test",
+        })
+
+        review_id = review_decision(picked_db, "pick_llm_test")
+        _persist_llm_review(picked_db, review_id, "gene_aggressive_v1", contract)
+        picked_db.commit()
+
+        signals = list_optimization_signals(picked_db, gene_id="gene_aggressive_v1")
+        llm_signals = [s for s in signals if s.get("source_type") == "llm_review"]
+        assert len(llm_signals) > 0, "No LLM-generated signals created"
+        for s in llm_signals:
+            assert s["status"] == "candidate", f"LLM signal should be candidate, got {s['status']}"
