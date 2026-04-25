@@ -1,9 +1,30 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 from . import repository
 from .strategies import seed_default_genes
+
+
+def _is_live_connection(conn: sqlite3.Connection) -> bool:
+    """Detect whether *conn* points to the live-mode database.
+
+    Checks the canonical live-path first, then falls back to a filename
+    heuristic so tests that use ``tmp_path / "live.db"`` are also caught.
+    """
+    from .runtime import LIVE_DB_PATH
+
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except sqlite3.Error:
+        return False
+    if row is None:
+        return False
+    db_file = row[2]  # third column = file path
+    if db_file is None:  # in-memory
+        return False
+    return Path(db_file).resolve() == LIVE_DB_PATH.resolve() or "live" in Path(db_file).name
 
 
 DEMO_DATES = [
@@ -19,6 +40,8 @@ DEMO_DATES = [
 
 
 def seed_demo_data(conn: sqlite3.Connection) -> None:
+    if _is_live_connection(conn):
+        raise SystemExit("seed-demo is not allowed in live mode")
     seed_default_genes(conn)
     for date in DEMO_DATES:
         repository.upsert_trading_day(conn, date, True)

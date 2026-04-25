@@ -124,13 +124,8 @@ def run_daily_pipeline(
     trading_date: str,
     providers: list[MarketDataProvider] | None = None,
 ) -> list[dict[str, Any]]:
-    if providers is None:
-        return [
-            run_phase(conn, "sync_data", trading_date),
-            run_phase(conn, "preopen_pick", trading_date),
-            run_phase(conn, "simulate", trading_date),
-            run_phase(conn, "review", trading_date),
-        ]
+    if not providers:
+        raise ValueError("providers is required: pass at least one MarketDataProvider")
     with research_run(conn, "sync_data", trading_date) as run:
         result = sync_all_data(conn, trading_date, providers=providers)
         run.finish(result)
