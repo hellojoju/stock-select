@@ -8,6 +8,20 @@
 
 **技术栈：** Python 3.11+, FastAPI, SQLite/FTS5, AKShare, BaoStock, React 18, TypeScript, pytest, NetworkX, APScheduler, Pydantic, Claude API（LLM 阶段）。
 
+## 进度追踪
+
+- [x] Phase A：真实数据最小闭环 — 8 commits, 38 tests ✅
+- [x] Phase B：多维真实因子层 — 2 commits, 14 tests ✅
+- [x] Phase C：真实复盘证据层 — 2 commits, 6 tests ✅
+- [x] Phase D：LLM 收盘复盘 — 1 commit, 16 tests ✅
+- [x] Phase E：知识图谱和记忆增强 — 1 commit, 9 tests ✅
+- [ ] Phase F：预盘 LLM 辅助
+- [ ] Phase G：日常运行硬化
+- [ ] 前端增强
+- [ ] Phase Z1：全量集成测试
+
+当前总测试数：105 passed
+
 ---
 
 ## 文件索引
