@@ -17,10 +17,10 @@
 - [x] Phase E：知识图谱和记忆增强 — 1 commit, 9 tests ✅
 - [x] Phase F：预盘 LLM 辅助 — 1 commit, 15 tests ✅
 - [x] Phase G：日常运行硬化 — 1 commit, 6 tests ✅
-- [ ] 前端增强
+- [x] 前端增强 — 1 commit (组件拆分) + 1 commit (辅助面板) ✅
 - [x] Phase Z1：全量集成测试 — 1 commit, 15 tests ✅
 
-当前总测试数：145 passed
+当前总测试数：163 passed
 
 ---
 
