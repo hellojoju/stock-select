@@ -37,6 +37,8 @@ from .runtime import resolve_runtime
 from .simulator import summarize_performance
 from .strategies import seed_default_genes
 from .system_review import review_summary
+from .task_monitor import get_recent_runs, get_daily_report, get_error_summary, get_phase_summary
+from .data_health import check_source_health, get_coverage, generate_health_report, get_missing_dates
 
 try:  # pragma: no cover - FastAPI is optional in the local test environment.
     from fastapi import FastAPI, Query
@@ -451,6 +453,105 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
         conn = db()
         try:
             return query_graph(conn, node_type, limit)
+        finally:
+            conn.close()
+
+    # --- Monitor endpoints ---
+
+    @app.get("/api/monitor/runs")
+    def monitor_runs(status: str | None = None, phase: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        conn = db()
+        try:
+            runs = get_recent_runs(conn, status=status, phase=phase, limit=limit)
+            return [
+                {
+                    "run_id": r.run_id,
+                    "phase": r.phase,
+                    "trading_date": r.trading_date,
+                    "status": r.status,
+                    "error": r.error,
+                    "started_at": r.started_at,
+                    "finished_at": r.finished_at,
+                }
+                for r in runs
+            ]
+        finally:
+            conn.close()
+
+    @app.get("/api/monitor/daily-report")
+    def monitor_daily_report(date: str) -> dict[str, Any]:
+        conn = db()
+        try:
+            report = get_daily_report(conn, date)
+            return {
+                "trading_date": report.trading_date,
+                "phases_run": report.phases_run,
+                "phases_missing": report.phases_missing,
+                "all_ok": report.all_ok,
+                "errors": report.errors,
+            }
+        finally:
+            conn.close()
+
+    @app.get("/api/monitor/errors")
+    def monitor_errors(limit: int = 20) -> list[dict[str, Any]]:
+        conn = db()
+        try:
+            return get_error_summary(conn, limit=limit)
+        finally:
+            conn.close()
+
+    @app.get("/api/monitor/phase-summary")
+    def monitor_phase_summary(phase: str) -> dict[str, Any]:
+        conn = db()
+        try:
+            summary = get_phase_summary(conn, phase)
+            return {
+                "phase": summary.phase,
+                "total_runs": summary.total_runs,
+                "ok_runs": summary.ok_runs,
+                "error_runs": summary.error_runs,
+                "last_run_date": summary.last_run_date,
+                "last_run_status": summary.last_run_status,
+            }
+        finally:
+            conn.close()
+
+    @app.get("/api/monitor/health")
+    def monitor_health() -> dict[str, Any]:
+        conn = db()
+        try:
+            report = generate_health_report(conn)
+            return {
+                "generated_at": report.generated_at,
+                "sources": [
+                    {
+                        "source": s.source,
+                        "status": s.status,
+                        "last_sync": s.last_sync,
+                        "staleness_hours": s.staleness_hours,
+                    }
+                    for s in report.sources
+                ],
+                "latest_trading_date": report.latest_trading_date,
+                "coverage": {
+                    "trading_date": report.coverage_today.trading_date,
+                    "stocks_synced": report.coverage_today.stocks_synced,
+                    "prices_synced": report.coverage_today.prices_synced,
+                    "coverage_pct": report.coverage_today.coverage_pct,
+                    "factor_types": report.coverage_today.factor_types,
+                } if report.coverage_today else None,
+                "stale_sources": report.stale_sources,
+                "error_count": report.error_count,
+            }
+        finally:
+            conn.close()
+
+    @app.get("/api/monitor/missing-dates")
+    def monitor_missing_dates(days: int = 5) -> list[str]:
+        conn = db()
+        try:
+            return get_missing_dates(conn, lookback_days=days)
         finally:
             conn.close()
 
