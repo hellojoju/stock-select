@@ -26,6 +26,196 @@ from .runtime import resolve_runtime
 from .simulator import summarize_performance
 from .strategies import seed_default_genes
 from .system_review import review_summary
+from .stock_views import search_stocks
+
+
+def _load_market_context(conn, trading_date: str, result: dict) -> None:
+    """Load market overview and sentiment cycle, generating if not available."""
+    try:
+        from .market_overview import get_market_overview, generate_market_overview
+        overview = get_market_overview(conn, trading_date)
+        if overview is None:
+            overview = generate_market_overview(conn, trading_date)
+        if overview:
+            from .market_overview import MarketOverview
+            result["market_overview"] = _to_dict(overview)
+    except Exception:
+        pass
+
+    try:
+        from .sentiment_cycle import get_sentiment_cycle, generate_sentiment_cycle
+        cycle = get_sentiment_cycle(conn, trading_date)
+        if cycle is None:
+            cycle = generate_sentiment_cycle(conn, trading_date)
+        if cycle:
+            result["sentiment_cycle"] = _to_dict(cycle)
+    except Exception:
+        pass
+
+
+def _load_sector_quant(conn, stock_code: str, trading_date: str, result: dict) -> None:
+    """Load sector analysis, stock quant, psychology review, and next day plan."""
+    # Sector analysis
+    try:
+        from .sector_analysis import analyze_all_sectors, get_top_sectors
+        sectors = get_top_sectors(conn, trading_date, limit=5)
+        if sectors:
+            result["sector_analysis"] = {"top_sectors": [dict(s.__dict__) if hasattr(s, '__dict__') else s for s in sectors]}
+        else:
+            sectors = analyze_all_sectors(conn, trading_date)
+            if sectors:
+                result["sector_analysis"] = {"top_sectors": [dict(s.__dict__) if hasattr(s, '__dict__') else s for s in sectors[:5]]}
+    except Exception:
+        pass
+
+    # Stock quant
+    try:
+        from .stock_quant import build_stock_quant_report
+        quant = build_stock_quant_report(conn, stock_code, trading_date)
+        if quant:
+                result["stock_quant"] = _to_dict(quant)
+    except Exception:
+        pass
+
+    # Psychology review
+    try:
+        from .psychology_review import get_psychology_review, generate_psychology_review
+        decisions = result.get("decisions", [])
+        if decisions:
+            decision = decisions[0]
+            review_id = decision.get("review_id", "")
+            if review_id:
+                psych = get_psychology_review(conn, review_id)
+                if psych is None:
+                    psych = generate_psychology_review(conn, review_id)
+                if psych:
+                    result["psychology_review"] = _to_dict(psych)
+    except Exception:
+        pass
+
+    # Next day plan
+    try:
+        from .next_day_plan import get_next_day_plan, generate_next_day_plan
+        decisions = result.get("decisions", [])
+        if decisions:
+            decision = decisions[0]
+            review_id = decision.get("review_id", "")
+            if review_id:
+                plan = get_next_day_plan(conn, review_id)
+                if plan is None:
+                    plan = generate_next_day_plan(conn, review_id)
+                if plan:
+                    result["next_day_plan"] = _to_dict(plan)
+    except Exception:
+        pass
+
+    # Capital flow
+    try:
+        from .capital_flow import build_capital_flow_report
+        cf = build_capital_flow_report(conn, stock_code, trading_date)
+        if cf:
+            result["capital_flow"] = _to_dict(cf)
+    except Exception:
+        pass
+
+    # Custom sector tags
+    try:
+        from .stock_classifier import get_custom_sector_tags, classify_custom_sectors
+        tags = get_custom_sector_tags(conn, stock_code, trading_date)
+        if not tags:
+            # Run classification if not yet done
+            classify_custom_sectors(conn, trading_date)
+            tags = get_custom_sector_tags(conn, stock_code, trading_date)
+        if tags:
+            result["custom_sector_tags"] = tags
+    except Exception:
+        pass
+
+
+def _to_dict(obj):
+    """Recursively convert dataclass to dict."""
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (list, tuple)):
+        return [_to_dict(x) for x in obj]
+    if hasattr(obj, '__dataclass_fields__'):
+        return {k: _to_dict(v) for k, v in obj.__dict__.items()}
+    if hasattr(obj, '__dict__'):
+        return {k: _to_dict(v) for k, v in obj.__dict__.items()}
+    return obj
+
+
+def _generate_stock_ai_summary(
+    conn, result: dict, stock_code: str, trading_date: str
+) -> str | None:
+    """用 LLM 生成自然语言复盘总结。"""
+    try:
+        from .llm_config import resolve_llm_config
+        config = resolve_llm_config()
+        if config is None:
+            return None
+
+        decisions = result.get("decisions", [])
+        is_hypo = result.get("hypothetical")
+        verdict = decisions[0].get("verdict", "") if decisions else ""
+        driver = decisions[0].get("primary_driver", "") if decisions else ""
+        factor_items = decisions[0].get("factor_items", []) if decisions else []
+        factor_summary = []
+        for f in factor_items[:8]:
+            factor_summary.append(f"- {f.get('factor_type', '')}: {f.get('verdict', '')}（{f.get('contribution_score', 0):.2f}）")
+
+        market = result.get("market_overview", {})
+        sentiment = result.get("sentiment_cycle", {})
+
+        prompt = (
+            f"你是一位资深 A 股分析师。请根据以下数据，用通俗易懂的中文，"
+            f"用 3-5 段话总结 {stock_code} 在 {trading_date} 的复盘情况。\n"
+            f"{'这是一个假设性复盘，该股票未被策略选中。' if is_hypo else ''}\n"
+            f"综合结论：{verdict}\n"
+            f"主要驱动因素：{driver}\n"
+            f"因子检查：\n{'\n'.join(factor_summary)}\n"
+            f"市场环境：{market.get('style_preference', 'unknown')}, "
+            f"涨{market.get('advance_count', 0)}跌{market.get('decline_count', 0)}\n"
+            f"情绪周期：{sentiment.get('cycle_phase', 'unknown')}\n"
+            f"请直接输出总结文字，不要使用 JSON 格式。"
+        )
+
+        import httpx
+        if config.provider == "deepseek":
+            model = config.model if hasattr(config, 'model') else "deepseek-chat"
+            resp = httpx.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 500},
+                timeout=30,
+            )
+            data = resp.json()
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or None
+        elif config.provider == "anthropic":
+            base_url = config.base_url or "https://api.anthropic.com"
+            resp = httpx.post(
+                f"{base_url}/v1/messages",
+                headers={"x-api-key": config.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": config.model, "max_tokens": 500, "messages": [{"role": "user", "content": prompt}]},
+                timeout=30,
+            )
+            data = resp.json()
+            return data.get("content", [{}])[0].get("text", "").strip() or None
+        elif config.provider == "openai":
+            base_url = config.base_url or "https://api.openai.com/v1"
+            resp = httpx.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"},
+                json={"model": config.model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 500},
+                timeout=30,
+            )
+            data = resp.json()
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or None
+    except Exception:
+        return None
+    return None
 
 
 def run_server(host: str = "127.0.0.1", port: int = 18425, db_path: str | Path | None = None, mode: str = "demo") -> None:
@@ -59,6 +249,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.respond_json(self.get_config())
             elif parsed.path == "/api/picks":
                 self.respond_json(self.picks(params))
+            elif parsed.path == "/api/stocks/search":
+                self.respond_json(self.stock_search(params))
             elif parsed.path == "/api/genes":
                 self.respond_json(self.genes())
             elif parsed.path == "/api/evolution/events":
@@ -92,6 +284,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/api/reviews/stocks/"):
                 stock_code = parsed.path.split("/")[4]
                 self.respond_json(self.stock_review(stock_code, params))
+            elif parsed.path.startswith("/api/reviews/custom-sectors/"):
+                stock_code = parsed.path.split("/")[4]
+                self.respond_json(self.custom_sector_tags(stock_code, params))
             elif parsed.path == "/api/reviews/preopen-strategies":
                 self.respond_json(self.preopen_strategy_reviews(params))
             elif parsed.path.startswith("/api/reviews/preopen-strategies/"):
@@ -111,6 +306,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.respond_json(self.blindspots(params["date"]))
             elif parsed.path == "/api/graph/query":
                 self.respond_json(self.graph_query(params))
+            elif parsed.path == "/api/reviews/history/hypothetical":
+                self.respond_json(self.hypothetical_review_history(params))
+            elif parsed.path == "/api/reviews/history/strategy-picks":
+                self.respond_json(self.strategy_picks_history(params))
+            elif parsed.path.startswith("/api/reviews/steps/"):
+                session_id = parsed.path.split("/")[-1]
+                self.respond_json(self.review_steps(session_id))
+            elif parsed.path == "/api/system/status":
+                self.respond_json(self.system_status(params.get("date")))
             elif parsed.path == "/health":
                 self.respond_json({"status": "ok"})
             else:
@@ -300,6 +504,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def stock_search(self, params: dict[str, str]):
+        conn = self.db()
+        try:
+            return search_stocks(conn, params.get("q", ""), limit=int(params.get("limit", "12")))
+        finally:
+            conn.close()
+
     def genes(self):
         conn = self.db()
         try:
@@ -361,9 +572,82 @@ class ApiHandler(BaseHTTPRequestHandler):
             conn.close()
 
     def stock_review(self, stock_code: str, params: dict[str, str]):
+        import uuid as _uuid
+        from .step_logger import init_session, log_step
+        session_id = f"review_{stock_code}_{params.get('date', '')}_{_uuid.uuid4().hex[:8]}"
+        init_session(session_id)
         conn = self.db()
         try:
-            return stock_review(conn, stock_code, params["date"], params.get("gene_id"))
+            log_step(session_id, f"开始复盘 {stock_code}",
+                     f"日期={params.get('date', '')}, gene_id={params.get('gene_id', 'default')}",
+                     request_data={"stock_code": stock_code, "date": params.get("date", ""), "gene_id": params.get("gene_id")})
+            result = stock_review(conn, stock_code, params["date"], params.get("gene_id"))
+            result["_session_id"] = session_id
+
+            if result.get("hypothetical"):
+                log_step(session_id, "触发假设性复盘",
+                         "无策略决策记录，启动多维度实时分析",
+                         response_data={"stock_code": stock_code, "hypothetical": True})
+                conn.execute(
+                    "INSERT OR IGNORE INTO hypothetical_review_log (stock_code, trading_date) VALUES (?, ?)",
+                    (stock_code, params["date"]),
+                )
+                conn.commit()
+            else:
+                log_step(session_id, "找到策略决策记录",
+                         f"从数据库加载复盘数据",
+                         response_data={"stock_code": stock_code, "hypothetical": False, "decisions_count": len(result.get("decisions", []))})
+
+            log_step(session_id, "加载市场环境与情绪周期",
+                     "查询市场概览、涨跌家数、情绪周期阶段",
+                     request_data={"trading_date": params.get("date", "")})
+            _load_market_context(conn, params.get("date", ""), result)
+            market_ok = result.get("market_overview") is not None
+            sentiment_ok = result.get("sentiment_cycle") is not None
+            log_step(session_id, "市场环境加载完成",
+                     f"市场概览: {'有' if market_ok else '无'}, 情绪周期: {'有' if sentiment_ok else '无'}",
+                     completed=True,
+                     response_data={"market_overview": market_ok, "sentiment_cycle": sentiment_ok})
+            log_step(session_id, "加载行业分析与量化因子",
+                     "查询行业板块、连板形态、均线量价、资金流向",
+                     request_data={"stock_code": stock_code})
+            _load_sector_quant(conn, stock_code, params.get("date", ""), result)
+            sq = {k: result.get(k) is not None for k in ["sector_analysis", "stock_quant", "capital_flow", "custom_sector_tags"]}
+            log_step(session_id, "行业量化加载完成",
+                     ", ".join(f"{k}: {'有' if v else '无'}" for k, v in sq.items()),
+                     completed=True,
+                     response_data=sq)
+
+            # AI summary
+            log_step(session_id, "生成 AI 解读", "调用 LLM API 生成自然语言总结", completed=False)
+            ai_summary = _generate_stock_ai_summary(conn, result, stock_code, params.get("date", ""))
+            result["ai_summary"] = ai_summary
+            if ai_summary:
+                log_step(session_id, "AI 解读生成成功",
+                         ai_summary[:300],
+                         completed=True,
+                         response_data={"ai_summary_length": len(ai_summary), "ai_summary_preview": ai_summary[:200]})
+            else:
+                log_step(session_id, "AI 解读跳过",
+                         "LLM 未配置或 API 调用失败，跳过 AI 总结",
+                         completed=True,
+                         response_data={"reason": "LLM not configured or API failed"})
+
+            # Decisions summary
+            decisions = result.get("decisions", [])
+            decision_keys = []
+            for d in decisions:
+                dk = {k: v for k, v in d.items() if k in ("strategy_gene_id", "verdict", "return_pct", "primary_driver")}
+                decision_keys.append(dk)
+            log_step(session_id, "复盘完成",
+                     f"返回 {len(result)} 个字段，{len(decisions)} 个决策",
+                     completed=True,
+                     response_data={
+                         "total_fields": len(result),
+                         "field_names": list(result.keys()),
+                         "decisions": decision_keys,
+                     })
+            return result
         finally:
             conn.close()
 
@@ -371,6 +655,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         conn = self.db()
         try:
             return stock_review_history(conn, stock_code, params["start"], params["end"], params.get("gene_id"))
+        finally:
+            conn.close()
+
+    def custom_sector_tags(self, stock_code: str, params: dict[str, str]):
+        conn = self.db()
+        try:
+            from .stock_classifier import get_custom_sector_tags, SECTOR_DISPLAY_NAMES
+            date = params.get("date", params.get("trading_date", ""))
+            tags = get_custom_sector_tags(conn, stock_code, date)
+            return {
+                "tags": [
+                    {"key": t, "display": SECTOR_DISPLAY_NAMES.get(t, t)}
+                    for t in tags
+                ],
+            }
         finally:
             conn.close()
 
@@ -544,6 +843,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 d = dict(r)
                 d["attribution"] = json.loads(d.pop("attribution_json", "[]"))
                 d["reason_check"] = json.loads(d.pop("reason_check_json", "{}"))
+                d["suggested_errors"] = json.loads(d.pop("suggested_errors_json", "[]"))
                 d["suggested_signals"] = json.loads(d.pop("suggested_signals_json", "[]"))
                 if d.get("prompt_tokens") is not None:
                     d["token_usage"] = {
@@ -615,6 +915,59 @@ class ApiHandler(BaseHTTPRequestHandler):
             return {"error": "model required"}
         set_model_override(model)
         return {"status": "ok", "model": model}
+
+    def hypothetical_review_history(self, params: dict) -> dict:
+        from .repository import rows_to_dicts
+        conn = self.db()
+        try:
+            limit = int(params.get("limit", "20"))
+            rows = rows_to_dicts(conn.execute(
+                "SELECT stock_code, trading_date, reviewed_at FROM hypothetical_review_log ORDER BY reviewed_at DESC LIMIT ?",
+                (limit,),
+            ))
+            return {"reviews": rows}
+        finally:
+            conn.close()
+
+    def strategy_picks_history(self, params: dict) -> dict:
+        from .repository import rows_to_dicts
+        conn = self.db()
+        try:
+            date = params.get("date", "")
+            limit = int(params.get("limit", "20"))
+            clauses = []
+            p = []
+            if date:
+                clauses.append("trading_date = ?")
+                p.append(date)
+            clauses.append("1=1")
+            rows = rows_to_dicts(conn.execute(
+                f"""
+                SELECT DISTINCT d.stock_code, d.trading_date, d.strategy_gene_id, d.action, d.confidence,
+                       s.name as stock_name, s.industry
+                FROM pick_decisions d
+                LEFT JOIN stocks s ON s.stock_code = d.stock_code
+                WHERE {' AND '.join(clauses)}
+                ORDER BY d.trading_date DESC, d.stock_code
+                LIMIT ?
+                """,
+                [*p, limit],
+            ))
+            return {"picks": rows}
+        finally:
+            conn.close()
+
+    def review_steps(self, session_id: str) -> dict:
+        from .step_logger import get_session_steps
+        return {"steps": get_session_steps(session_id)}
+
+    def system_status(self, date: str | None) -> dict:
+        conn = self.db()
+        try:
+            current_date = date or latest_trading_date(conn)
+            return self.runtime_context.as_payload() | {"date": current_date}
+        finally:
+            conn.close()
 
     def read_body(self) -> str:
         length = int(self.headers.get("Content-Length", 0))
