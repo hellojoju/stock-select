@@ -13,48 +13,77 @@
 
 ## 快速开始
 
+### 安装
+
+```bash
+uv sync
+cd web && npm install && cd ..
+```
+
 ### 后端
 
 ```bash
-# 配置环境变量
-cp .env.example .env
-# 编辑 .env 填入 API Key
+# Demo 模式（无需 API Key）
+uv run stock-select serve --demo
 
-# 启动
-.venv/bin/python -m src.stock_select.server
+# Live 模式
+cp .env.example .env  # 编辑 .env 填入 API Key
+uv run stock-select serve
 ```
 
 ### 前端
 
 ```bash
 cd web
-npm install
 npm run dev
 ```
 
-打开 http://localhost:19283 访问平台界面。
+打开 http://localhost:5173 访问平台界面。
+
+## CLI 命令
+
+| 命令 | 说明 |
+|------|------|
+| `uv run stock-select serve` | 启动 Web 服务 + 定时调度器 |
+| `uv run stock-select serve --demo` | Demo 模式启动 |
+| `uv run stock-select pipeline` | 执行一次完整日线流水线 |
+| `uv run stock-select pipeline --demo` | Demo 模式流水线 |
+| `uv run stock-select sync` | 仅同步数据 |
+| `uv run stock-select status` | 查看系统状态 |
 
 ## 功能
 
 - LLM 驱动的股票研究与选股
 - 多模型策略构建与回测
 - 智能选股面板
-- 策略持续迭代优化
+- 策略持续迭代优化（基因进化）
 - 实时监控与可视化
+- 自动化每日交易工作流
 
 ## 技术栈
 
-- **后端**：Python 3.11+，uv，Anthropic/OpenAI API
+- **后端**：Python 3.11+，uv，FastAPI，APScheduler，SQLite（WAL + FTS5）
 - **前端**：React，Vite，TypeScript
-- **数据存储**：SQLite
+- **数据源**：AKShare，BaoStock（支持 Demo 模式）
+- **LLM**：Anthropic Claude / DeepSeek
+
+## 测试
+
+```bash
+pytest tests/ -q
+```
+
+450+ 测试全部通过，覆盖集成测试、单元测试、E2E 测试。
 
 ## 环境变量
 
 | 变量 | 说明 |
 |------|------|
-| `LLM_PROVIDER` | LLM 提供商（如 `deepseek`） |
+| `ANTHROPIC_API_KEY` | Claude API Key（LLM 复盘用） |
+| `LLM_PROVIDER` | LLM 提供商（`deepseek` / `anthropic` 等） |
 | `DEEPSEEK_API_KEY` | DeepSeek API Key |
-| `DEEPSEEK_BASE_URL` | API 地址（可选） |
+| `DEEPSEEK_BASE_URL` | DeepSeek API 地址（可选） |
+| `MODE` | 运行模式（`demo` / `live`） |
 
 ## License
 

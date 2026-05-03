@@ -4,18 +4,28 @@ import sqlite3
 from pathlib import Path
 
 
+# 项目根目录（基于此文件所在包的上级目录）
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# 默认数据库绝对路径
+_DEFAULT_DB = _PROJECT_ROOT / "var" / "stock_select.db"
+
 SCHEMA_VERSION = 2
 
 
-def connect(db_path: str | Path = "var/stock_select.db") -> sqlite3.Connection:
+def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     """Open a SQLite connection with project defaults."""
-    path = Path(db_path)
+    if db_path is None:
+        path = _DEFAULT_DB
+    else:
+        path = Path(db_path)
     if str(path) != ":memory:":
         path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")  # 5s wait before SQLITE_BUSY
     return conn
 
 
@@ -64,6 +74,7 @@ def init_db(conn: sqlite3.Connection) -> None:
           high REAL NOT NULL,
           low REAL NOT NULL,
           close REAL NOT NULL,
+          prev_close REAL,
           volume REAL NOT NULL DEFAULT 0,
           amount REAL NOT NULL DEFAULT 0,
           is_suspended INTEGER NOT NULL DEFAULT 0,
@@ -240,6 +251,13 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_pick_decisions_date
           ON pick_decisions(trading_date);
 
+        CREATE INDEX IF NOT EXISTS idx_research_runs_date_phase
+          ON research_runs(trading_date, phase);
+        CREATE INDEX IF NOT EXISTS idx_research_runs_status
+          ON research_runs(status);
+        CREATE INDEX IF NOT EXISTS idx_strategy_genes_status
+          ON strategy_genes(status);
+
         CREATE TABLE IF NOT EXISTS sim_orders (
           order_id TEXT PRIMARY KEY,
           decision_id TEXT NOT NULL REFERENCES pick_decisions(decision_id),
@@ -251,6 +269,8 @@ def init_db(conn: sqlite3.Connection) -> None:
           position_pct REAL NOT NULL,
           fee REAL NOT NULL DEFAULT 0,
           slippage_pct REAL NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'filled',
+          reject_reason TEXT,
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -298,6 +318,9 @@ def init_db(conn: sqlite3.Connection) -> None:
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           UNIQUE(decision_id)
         );
+
+        CREATE INDEX IF NOT EXISTS idx_decision_reviews_date
+          ON decision_reviews(trading_date);
 
         CREATE TABLE IF NOT EXISTS factor_review_items (
           item_id TEXT PRIMARY KEY,
@@ -448,6 +471,9 @@ def init_db(conn: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE INDEX IF NOT EXISTS idx_llm_scratchpad_review
+          ON llm_scratchpad(llm_review_id);
+
         CREATE TABLE IF NOT EXISTS analyst_reviews (
           analyst_review_id TEXT PRIMARY KEY,
           decision_id TEXT NOT NULL,
@@ -475,6 +501,11 @@ def init_db(conn: sqlite3.Connection) -> None:
           sentiment REAL,
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE INDEX IF NOT EXISTS idx_news_published_at
+          ON news_items(published_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_news_stock_code
+          ON news_items(related_stock_code);
 
         CREATE TABLE IF NOT EXISTS fundamental_metrics (
           stock_code TEXT NOT NULL REFERENCES stocks(stock_code),
@@ -683,6 +714,268 @@ def init_db(conn: sqlite3.Connection) -> None:
           props_json TEXT NOT NULL,
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS planner_plans (
+          plan_id TEXT PRIMARY KEY,
+          trading_date TEXT NOT NULL,
+          focus_sectors_json TEXT NOT NULL,
+          market_environment_json TEXT,
+          high_impact_events_json TEXT NOT NULL,
+          watch_risks_json TEXT NOT NULL,
+          llm_notes TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(trading_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS pick_evaluations (
+          evaluation_id TEXT PRIMARY KEY,
+          decision_id TEXT NOT NULL REFERENCES pick_decisions(decision_id),
+          trading_date TEXT NOT NULL,
+          stock_code TEXT NOT NULL,
+          strategy_gene_id TEXT NOT NULL,
+          return_pct REAL NOT NULL,
+          verdict TEXT NOT NULL,
+          thesis_quality REAL NOT NULL DEFAULT 0,
+          planner_aligned INTEGER NOT NULL DEFAULT 0,
+          notes TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(decision_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS pick_rerun_archives (
+          archive_id TEXT PRIMARY KEY,
+          trading_date TEXT NOT NULL,
+          strategy_gene_id TEXT NOT NULL,
+          decision_id TEXT,
+          artifact_type TEXT NOT NULL,
+          artifact_id TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          superseded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS market_overview_daily (
+          trading_date TEXT PRIMARY KEY,
+          sh_return REAL,
+          sz_return REAL,
+          cyb_return REAL,
+          bse_return REAL,
+          advance_count INTEGER DEFAULT 0,
+          decline_count INTEGER DEFAULT 0,
+          flat_count INTEGER DEFAULT 0,
+          limit_up_count INTEGER DEFAULT 0,
+          limit_down_count INTEGER DEFAULT 0,
+          top_volume_stocks TEXT DEFAULT '[]',
+          top_amount_stocks TEXT DEFAULT '[]',
+          style_preference TEXT,
+          main_sectors TEXT DEFAULT '[]',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS sentiment_cycle_daily (
+          trading_date TEXT PRIMARY KEY,
+          advance_count INTEGER DEFAULT 0,
+          decline_count INTEGER DEFAULT 0,
+          limit_up_count INTEGER DEFAULT 0,
+          limit_down_count INTEGER DEFAULT 0,
+          seal_rate REAL,
+          promotion_rate REAL,
+          financing_balance REAL,
+          financing_change_pct REAL,
+          short_selling_balance REAL,
+          short_selling_change_pct REAL,
+          news_heat REAL,
+          llm_sentiment_score REAL,
+          composite_sentiment REAL,
+          cycle_phase TEXT,
+          cycle_reason TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS sector_analysis_daily (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          trading_date TEXT NOT NULL,
+          sector_name TEXT NOT NULL,
+          sector_return_pct REAL DEFAULT 0,
+          strength_1d REAL DEFAULT 0,
+          strength_3d REAL DEFAULT 0,
+          strength_10d REAL DEFAULT 0,
+          stock_count INTEGER DEFAULT 0,
+          advance_ratio REAL DEFAULT 0,
+          leader_stock TEXT,
+          leader_return_pct REAL DEFAULT 0,
+          leader_limit_up_days INTEGER DEFAULT 0,
+          mid_tier_stocks TEXT DEFAULT '[]',
+          follower_stocks TEXT DEFAULT '[]',
+          drive_logic TEXT,
+          team_complete INTEGER DEFAULT 0,
+          sustainability REAL DEFAULT 0,
+          limit_up_3d_count INTEGER DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(trading_date, sector_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS capital_flow_daily (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          trading_date TEXT NOT NULL,
+          stock_code TEXT NOT NULL REFERENCES stocks(stock_code),
+          main_net_inflow REAL DEFAULT 0,
+          large_order_inflow REAL DEFAULT 0,
+          super_large_inflow REAL DEFAULT 0,
+          retail_outflow REAL DEFAULT 0,
+          flow_trend TEXT,
+          sector_flow_rank INTEGER,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(trading_date, stock_code)
+        );
+
+        CREATE TABLE IF NOT EXISTS stock_custom_sector (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          trading_date TEXT NOT NULL,
+          stock_code TEXT NOT NULL REFERENCES stocks(stock_code),
+          sector_key TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(trading_date, stock_code, sector_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_custom_sector_date
+          ON stock_custom_sector(trading_date, sector_key);
+
+        CREATE INDEX IF NOT EXISTS idx_capital_flow_date
+          ON capital_flow_daily(trading_date, stock_code);
+
+        CREATE INDEX IF NOT EXISTS idx_sector_date_name
+          ON sector_analysis_daily(trading_date, sector_name);
+
+        CREATE TABLE IF NOT EXISTS psychology_review (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          decision_review_id TEXT NOT NULL UNIQUE REFERENCES decision_reviews(review_id),
+          success_reasons TEXT DEFAULT '[]',
+          failure_reasons TEXT DEFAULT '[]',
+          psychological_category TEXT,
+          reproducible_patterns TEXT DEFAULT '[]',
+          prevention_strategies TEXT DEFAULT '[]',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS next_day_plan (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          decision_review_id TEXT NOT NULL UNIQUE REFERENCES decision_reviews(review_id),
+          scenarios TEXT DEFAULT '[]',
+          key_levels TEXT DEFAULT '[]',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS hypothetical_review_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          stock_code TEXT NOT NULL,
+          trading_date TEXT NOT NULL,
+          reviewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(stock_code, trading_date)
+        );
+
+        -- Announcement hunter: alert records
+        CREATE TABLE IF NOT EXISTS announcement_alerts (
+          alert_id TEXT PRIMARY KEY,
+          trading_date TEXT NOT NULL,
+          discovered_at TEXT NOT NULL,
+          stock_code TEXT NOT NULL,
+          stock_name TEXT,
+          industry TEXT,
+          source TEXT NOT NULL,
+          alert_type TEXT NOT NULL,
+          title TEXT NOT NULL,
+          summary TEXT,
+          source_url TEXT,
+          event_ids_json TEXT,
+          sentiment_score REAL NOT NULL DEFAULT 0,
+          capital_flow_score REAL,
+          sector_heat_score REAL,
+          chip_structure_score REAL,
+          shareholder_trend_score REAL,
+          confidence REAL NOT NULL DEFAULT 0.5,
+          status TEXT NOT NULL DEFAULT 'new',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(stock_code, title, source)
+        );
+
+        -- Announcement hunter: polling run audit log
+        CREATE TABLE IF NOT EXISTS monitor_runs (
+          run_id TEXT PRIMARY KEY,
+          started_at TEXT NOT NULL,
+          finished_at TEXT,
+          source TEXT,
+          documents_fetched INTEGER NOT NULL DEFAULT 0,
+          new_documents INTEGER NOT NULL DEFAULT 0,
+          alerts_generated INTEGER NOT NULL DEFAULT 0,
+          error TEXT,
+          status TEXT NOT NULL DEFAULT 'running'
+        );
+
+        -- Announcement hunter: sector heat cache
+        CREATE TABLE IF NOT EXISTS sector_heat_index (
+          trading_date TEXT NOT NULL,
+          industry TEXT NOT NULL,
+          heat_score REAL NOT NULL,
+          stock_count INTEGER NOT NULL,
+          limit_up_count INTEGER NOT NULL DEFAULT 0,
+          total_flow REAL,
+          announcement_count INTEGER NOT NULL DEFAULT 0,
+          composite_return_pct REAL,
+          computed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (trading_date, industry)
+        );
+
+        -- Announcement hunter: scan event log (persistent, not in-memory)
+        CREATE TABLE IF NOT EXISTS scan_events (
+          event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          occurred_at TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          message TEXT NOT NULL,
+          detail TEXT NOT NULL DEFAULT '',
+          level TEXT NOT NULL DEFAULT 'info'
+        );
+
+        -- Market environment daily log
+        CREATE TABLE IF NOT EXISTS market_environment_logs (
+          log_id TEXT PRIMARY KEY,
+          trading_date TEXT NOT NULL UNIQUE,
+          market_environment TEXT NOT NULL,
+          trend_type TEXT,
+          volatility_level TEXT,
+          breadth_up_count INT,
+          breadth_down_count INT,
+          limit_up_count INT,
+          limit_down_count INT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Gene performance by environment
+        CREATE TABLE IF NOT EXISTS gene_environment_performance (
+          gene_id TEXT NOT NULL,
+          market_environment TEXT NOT NULL,
+          period_start TEXT NOT NULL,
+          period_end TEXT NOT NULL,
+          trade_count INT,
+          win_rate REAL,
+          avg_return REAL,
+          max_drawdown REAL,
+          alpha REAL,
+          PRIMARY KEY (gene_id, market_environment, period_start)
+        );
+
+        -- Evolution proposals
+        CREATE TABLE IF NOT EXISTS evolution_proposals (
+          proposal_id TEXT PRIMARY KEY,
+          parent_gene_id TEXT NOT NULL REFERENCES strategy_genes(gene_id),
+          child_gene_id TEXT REFERENCES strategy_genes(gene_id),
+          market_environment TEXT,
+          alpha_change REAL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          changes_json TEXT NOT NULL,
+          expected_alpha_improvement REAL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          applied_at TEXT
+        );
         """
     )
 
@@ -704,7 +997,84 @@ def _ensure_live_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "source_daily_prices", "is_limit_up", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "source_daily_prices", "is_limit_down", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "data_sources", "source_reliability", "TEXT NOT NULL DEFAULT 'medium'")
+    ensure_column(conn, "sim_orders", "status", "TEXT NOT NULL DEFAULT 'filled'")
+    ensure_column(conn, "sim_orders", "reject_reason", "TEXT")
+    ensure_column(conn, "strategy_genes", "strategy_type", "TEXT DEFAULT 'generic'")
+    ensure_column(conn, "strategy_genes", "market_environments_json", "TEXT DEFAULT '[\"all\"]'")
+    ensure_column(conn, "strategy_genes", "factor_config_json", "TEXT DEFAULT '{}'")
+    ensure_column(conn, "strategy_genes", "beta", "REAL DEFAULT 1.0")
+    ensure_column(conn, "outcomes", "benchmark_return", "REAL DEFAULT 0.0")
+    ensure_column(conn, "outcomes", "sector_return", "REAL DEFAULT 0.0")
+    ensure_column(conn, "outcomes", "alpha", "REAL")
+    _ensure_knowledge_tables(conn)
     _ensure_evidence_schema(conn)
+
+
+def _ensure_knowledge_tables(conn: sqlite3.Connection) -> None:
+    """Create knowledge base tables that are only created in the FTS fallback path."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS raw_documents (
+          document_id TEXT PRIMARY KEY,
+          source TEXT NOT NULL,
+          source_type TEXT NOT NULL,
+          source_url TEXT,
+          title TEXT NOT NULL,
+          summary TEXT,
+          content_text TEXT,
+          content_hash TEXT NOT NULL,
+          published_at TEXT,
+          captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          author TEXT,
+          related_stock_codes_json TEXT NOT NULL DEFAULT '[]',
+          related_industries_json TEXT NOT NULL DEFAULT '[]',
+          language TEXT DEFAULT 'zh',
+          license_status TEXT DEFAULT 'unknown',
+          fetch_status TEXT DEFAULT 'ok',
+          raw_path TEXT,
+          event_category TEXT DEFAULT 'other'
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS document_stock_links (
+          document_id TEXT NOT NULL REFERENCES raw_documents(document_id),
+          stock_code TEXT NOT NULL REFERENCES stocks(stock_code),
+          relation_type TEXT NOT NULL DEFAULT 'mentioned',
+          confidence REAL NOT NULL DEFAULT 0.5,
+          evidence_text TEXT,
+          PRIMARY KEY (document_id, stock_code, relation_type)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+          title,
+          summary,
+          content_text,
+          document_id UNINDEXED,
+          tokenize='unicode61'
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS document_fetch_logs (
+          log_id TEXT PRIMARY KEY,
+          source TEXT NOT NULL,
+          fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          status TEXT NOT NULL,
+          records_fetched INTEGER DEFAULT 0,
+          records_stored INTEGER DEFAULT 0,
+          error_message TEXT,
+          raw_url TEXT
+        )
+        """
+    )
+    # S3.5: Ensure event_category column exists for existing databases
+    ensure_column(conn, "raw_documents", "event_category", "TEXT DEFAULT 'other'")
 
 
 def _ensure_evidence_schema(conn: sqlite3.Connection) -> None:
@@ -801,7 +1171,7 @@ def _create_fts(conn: sqlite3.Connection) -> None:
             """
         )
     except sqlite3.OperationalError:
-        conn.execute(
+        conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS memory_fts_fallback (
               rowid INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -809,6 +1179,65 @@ def _create_fts(conn: sqlite3.Connection) -> None:
               trading_date TEXT,
               source_type TEXT,
               source_id TEXT
-            )
+            );
+
+            CREATE TABLE IF NOT EXISTS raw_documents (
+              document_id TEXT PRIMARY KEY,
+              source TEXT NOT NULL,
+              source_type TEXT NOT NULL,
+              source_url TEXT,
+              title TEXT NOT NULL,
+              summary TEXT,
+              content_text TEXT,
+              content_hash TEXT NOT NULL,
+              published_at TEXT,
+              captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              author TEXT,
+              related_stock_codes_json TEXT NOT NULL DEFAULT '[]',
+              related_industries_json TEXT NOT NULL DEFAULT '[]',
+              language TEXT DEFAULT 'zh',
+              license_status TEXT DEFAULT 'unknown',
+              fetch_status TEXT DEFAULT 'ok',
+              raw_path TEXT,
+              event_category TEXT DEFAULT 'other'
+            );
+
+            CREATE TABLE IF NOT EXISTS document_chunks (
+              chunk_id TEXT PRIMARY KEY,
+              document_id TEXT NOT NULL REFERENCES raw_documents(document_id),
+              chunk_index INTEGER NOT NULL,
+              chunk_text TEXT NOT NULL,
+              token_count INTEGER,
+              embedding_id TEXT,
+              content_hash TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS document_stock_links (
+              document_id TEXT NOT NULL REFERENCES raw_documents(document_id),
+              stock_code TEXT NOT NULL REFERENCES stocks(stock_code),
+              relation_type TEXT NOT NULL DEFAULT 'mentioned',
+              confidence REAL NOT NULL DEFAULT 0.5,
+              evidence_text TEXT,
+              PRIMARY KEY (document_id, stock_code, relation_type)
+            );
+
+            CREATE TABLE IF NOT EXISTS document_fetch_logs (
+              log_id TEXT PRIMARY KEY,
+              source TEXT NOT NULL,
+              fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              status TEXT NOT NULL,
+              records_fetched INTEGER DEFAULT 0,
+              records_stored INTEGER DEFAULT 0,
+              error_message TEXT,
+              raw_url TEXT
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+              title,
+              summary,
+              content_text,
+              document_id UNINDEXED,
+              tokenize='unicode61'
+            );
             """
         )

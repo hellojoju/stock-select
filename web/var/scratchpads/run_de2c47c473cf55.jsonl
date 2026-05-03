@@ -1,0 +1,6 @@
+{"payload": {"phase": "simulate", "trading_date": "2026-01-14"}, "type": "init"}
+{"payload": {"reasons": ["event sources = 0", "review evidence = 0"], "status": "degraded"}, "type": "availability_gate"}
+{"payload": {"outcome_ids": ["outcome_3dda1b1d0e82", "outcome_f21a1765a587", "outcome_381206ac17d1", "outcome_65c1fa6da9d9", "outcome_908899ec646b", "outcome_3777b49a6453", "outcome_d3e4245e18b4", "outcome_6bceebdb6269"]}, "type": "done"}
+{"payload": {"phase": "simulate", "trading_date": "2026-01-14"}, "type": "init"}
+{"payload": {"reasons": ["event sources = 0", "review evidence = 0"], "status": "degraded"}, "type": "availability_gate"}
+{"payload": {"outcome_ids": ["outcome_3dda1b1d0e82", "outcome_f21a1765a587", "outcome_381206ac17d1", "outcome_65c1fa6da9d9", "outcome_908899ec646b", "outcome_3777b49a6453", "outcome_d3e4245e18b4", "outcome_6bceebdb6269"]}, "type": "done"}

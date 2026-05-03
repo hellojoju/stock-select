@@ -35,13 +35,18 @@ from .evidence_sync import (
 )
 from .blindspot_review import run_blindspot_review
 from .deterministic_review import run_deterministic_review
-from .evolution import default_week_window, evolve_weekly
+from .evolution import default_week_window, auto_promote_challengers, evolve_weekly
 from .gene_review import run_gene_reviews_for_date
+from .pick_evaluator import run_evaluation
+from .planner import plan_preopen_focus
 from .review import generate_deterministic_reviews
+from .pdf_extractor import process_pending_announcements
+from .announcement_events import process_announcement_text
 from .review_analysts import run_analyst_reviews
 from .simulator import simulate_day
 from .strategies import generate_picks_for_all_genes
 from .system_review import run_system_review
+from .data_availability import check_data_availability
 
 
 RUN_PHASES = {
@@ -50,6 +55,7 @@ RUN_PHASES = {
     "sync_trading_calendar",
     "sync_daily_prices",
     "sync_index_prices",
+    "sync_market_breadth",
     "publish_canonical_prices",
     "classify_market_environment",
     "sync_industries",
@@ -64,6 +70,7 @@ RUN_PHASES = {
     "sync_business_kpi_actuals",
     "sync_risk_events",
     "sync_evidence",
+    "process_announcements",
     "preopen_pick",
     "simulate",
     "review",
@@ -78,7 +85,13 @@ RUN_PHASES = {
 }
 
 
-def run_phase(conn: sqlite3.Connection, phase: str, trading_date: str) -> dict[str, Any]:
+def run_phase(
+    conn: sqlite3.Connection,
+    phase: str,
+    trading_date: str,
+    *,
+    runtime_mode: str = "demo",
+) -> dict[str, Any]:
     if phase not in RUN_PHASES:
         raise ValueError(f"Unknown phase: {phase}")
     with research_run(conn, phase, trading_date) as run:
@@ -92,6 +105,10 @@ def run_phase(conn: sqlite3.Connection, phase: str, trading_date: str) -> dict[s
             result = sync_daily_prices(conn, trading_date)
         elif phase == "sync_index_prices":
             result = sync_index_prices(conn, trading_date)
+        elif phase == "sync_market_breadth":
+            from .market_breadth import ensure_market_breadth
+
+            result = ensure_market_breadth(conn, trading_date)
         elif phase == "publish_canonical_prices":
             result = publish_canonical_prices(conn, trading_date)
         elif phase == "classify_market_environment":
@@ -120,14 +137,43 @@ def run_phase(conn: sqlite3.Connection, phase: str, trading_date: str) -> dict[s
             result = sync_risk_events(conn, trading_date, trading_date)
         elif phase == "sync_evidence":
             result = sync_evidence(conn, trading_date)
+        elif phase == "process_announcements":
+            processed = process_pending_announcements(conn, limit=20)
+            extracted = []
+            for item in processed:
+                text = conn.execute(
+                    "SELECT content_text FROM raw_documents WHERE document_id = ?",
+                    (item["document_id"],),
+                ).fetchone()
+                if text and text["content_text"]:
+                    stocks = conn.execute(
+                        "SELECT stock_code FROM document_stock_links WHERE document_id = ?",
+                        (item["document_id"],),
+                    ).fetchall()
+                    known_codes = [r["stock_code"] for r in stocks]
+                    counts = process_announcement_text(
+                        conn, item["document_id"], text["content_text"], trading_date, known_codes or None
+                    )
+                    extracted.append({**item, "extracted_events": counts})
+            result = {"processed": len(processed), "with_events": len(extracted), "details": extracted}
         elif phase == "preopen_pick":
-            result = {"decision_ids": generate_picks_for_all_genes(conn, trading_date)}
+            plan = plan_preopen_focus(conn, trading_date)
+            _store_planner_plan(conn, plan)
+            result = {
+                "decision_ids": generate_picks_for_all_genes(
+                    conn,
+                    trading_date,
+                    preserve_audit=runtime_mode == "live",
+                ),
+                "planner_plan": plan,
+            }
         elif phase == "simulate":
             result = {"outcome_ids": simulate_day(conn, trading_date)}
         elif phase == "review":
             result = {
                 "review_ids": generate_deterministic_reviews(conn, trading_date),
                 "blindspot_ids": scan_blindspots(conn, trading_date),
+                "pick_evaluations": run_evaluation(conn, trading_date),
             }
         elif phase == "deterministic_review":
             result = {"review_ids": run_deterministic_review(conn, trading_date)}
@@ -136,7 +182,7 @@ def run_phase(conn: sqlite3.Connection, phase: str, trading_date: str) -> dict[s
         elif phase == "gene_review":
             result = {"gene_review_ids": run_gene_reviews_for_date(conn, trading_date)}
         elif phase == "analyst_review":
-            result = {"analyst_reviews": run_analyst_reviews(conn, trading_date)}
+            result = {"analyst_reviews": run_analyst_reviews(conn, trading_date, include_llm=True)}
         elif phase == "system_review":
             result = {"system_review_id": run_system_review(conn, trading_date)}
         elif phase == "review_consolidation":
@@ -150,15 +196,41 @@ def run_phase(conn: sqlite3.Connection, phase: str, trading_date: str) -> dict[s
             result = run_llm_review(conn, trading_date)
         else:
             start, end = default_week_window()
-            result = evolve_weekly(conn, period_start=start, period_end=end)
+            evolve_result = evolve_weekly(conn, period_start=start, period_end=end)
+            auto_promoted = auto_promote_challengers(conn)
+            evolve_result["auto_promoted"] = auto_promoted
+            result = evolve_result
+        # Availability gate for critical phases
+        availability = None
+        if phase in ("sync_data", "preopen_pick", "simulate", "review", "deterministic_review", "blindspot_review", "analyst_review", "gene_review", "system_review"):
+            availability = check_data_availability(conn, trading_date)
+            if phase == "preopen_pick" and availability.pick_count == 0:
+                run.event("availability_gate", {"status": "failed", "reasons": availability.reasons})
+            elif phase in ("review", "deterministic_review", "blindspot_review", "analyst_review", "gene_review", "system_review") and availability.review_evidence_count == 0:
+                run.event("availability_gate", {"status": "degraded", "reasons": availability.reasons})
+            elif availability.status != "ok":
+                run.event("availability_gate", {"status": availability.status, "reasons": availability.reasons})
+
         run.finish(result)
-        return {"run_id": run.run_id, "phase": phase, "trading_date": trading_date, "result": result}
+        resp: dict[str, Any] = {"run_id": run.run_id, "phase": phase, "trading_date": trading_date, "result": result}
+        if availability is not None:
+            resp["availability"] = {
+                "status": availability.status,
+                "price_coverage_pct": availability.price_coverage_pct,
+                "pick_count": availability.pick_count,
+                "event_source_count": availability.event_source_count,
+                "review_evidence_count": availability.review_evidence_count,
+                "reasons": availability.reasons,
+            }
+        return resp
 
 
 def run_daily_pipeline(
     conn: sqlite3.Connection,
     trading_date: str,
     providers: list[MarketDataProvider] | None = None,
+    *,
+    runtime_mode: str = "demo",
 ) -> list[dict[str, Any]]:
     if not providers:
         raise ValueError("providers is required: pass at least one MarketDataProvider")
@@ -168,9 +240,9 @@ def run_daily_pipeline(
         sync_result = {"run_id": run.run_id, "phase": "sync_data", "trading_date": trading_date, "result": result}
     return [
         sync_result,
-        run_phase(conn, "preopen_pick", trading_date),
-        run_phase(conn, "simulate", trading_date),
-        run_phase(conn, "review", trading_date),
+        run_phase(conn, "preopen_pick", trading_date, runtime_mode=runtime_mode),
+        run_phase(conn, "simulate", trading_date, runtime_mode=runtime_mode),
+        run_phase(conn, "review", trading_date, runtime_mode=runtime_mode),
     ]
 
 
@@ -269,3 +341,35 @@ def calendar_start_for(trading_date: str) -> str:
     from datetime import datetime, timedelta
 
     return (datetime.strptime(trading_date, "%Y-%m-%d").date() - timedelta(days=45)).isoformat()
+
+
+def _store_planner_plan(conn: sqlite3.Connection, plan: dict[str, Any]) -> None:
+    """Persist the planner plan for later comparison with actual picks."""
+    import hashlib
+
+    plan_id = "plan_" + hashlib.sha1(f"{plan['trading_date']}:planner".encode()).hexdigest()[:12]
+    conn.execute(
+        """
+        INSERT INTO planner_plans(
+          plan_id, trading_date, focus_sectors_json, market_environment_json,
+          high_impact_events_json, watch_risks_json, llm_notes
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(trading_date) DO UPDATE SET
+          focus_sectors_json = excluded.focus_sectors_json,
+          market_environment_json = excluded.market_environment_json,
+          high_impact_events_json = excluded.high_impact_events_json,
+          watch_risks_json = excluded.watch_risks_json,
+          llm_notes = excluded.llm_notes
+        """,
+        (
+            plan_id,
+            plan["trading_date"],
+            json.dumps(plan["focus_sectors"]),
+            json.dumps(plan["market_environment"]),
+            json.dumps(plan["high_impact_events"]),
+            json.dumps(plan["watch_risks"]),
+            plan.get("llm_notes"),
+        ),
+    )
+    conn.commit()

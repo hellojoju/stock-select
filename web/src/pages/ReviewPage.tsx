@@ -9,9 +9,8 @@ import AnalystReviewPanel from '../sections/AnalystReviewPanel';
 import ReviewHistoryPanel from '../components/ReviewHistoryPanel';
 import ExecutionStepsPanel from '../components/ExecutionStepsPanel';
 import { llmStatusLabel } from '../lib/llmStatus';
+import { API_BASE } from '../api/client';
 import type { AnalystReview, Dashboard, LLMReview } from '../types';
-
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:18425';
 
 export default function ReviewPage({ initialStockCode = '' }: { initialStockCode?: string }) {
   const [activeTab, setActiveTab] = useState<'stock' | 'strategy' | 'blindspot' | 'llm' | 'signals'>('stock');
@@ -168,7 +167,7 @@ export default function ReviewPage({ initialStockCode = '' }: { initialStockCode
             <ReviewHistoryPanel date={date} onReviewStock={handleReviewStock} />
           </Panel>
           <Panel title="决策复盘" icon={<ShieldCheck size={18} />}>
-            <StockReviewPanel data={stockReview} />
+            <StockReviewPanel data={stockReview} date={date} onReviewStock={handleReviewStock} />
           </Panel>
           <Panel title="证据时间线" icon={<Activity size={18} />}>
             <EvidenceTimeline data={stockReview} />

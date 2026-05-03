@@ -58,6 +58,17 @@ def compare_and_publish_prices(
         published = primary if primary is not None else secondary
         published_source = primary_source if primary is not None else secondary_source
         if published is not None and result.status != "missing_all":
+            # Look up prev_close from previous trading day
+            prev_close_row = conn.execute(
+                """
+                SELECT close FROM daily_prices
+                WHERE stock_code = ? AND trading_date < ?
+                ORDER BY trading_date DESC
+                LIMIT 1
+                """,
+                (stock_code, trading_date),
+            ).fetchone()
+            prev_close = float(prev_close_row["close"]) if prev_close_row else None
             repository.upsert_daily_price(
                 conn,
                 stock_code=stock_code,
@@ -66,6 +77,7 @@ def compare_and_publish_prices(
                 high=float(published["high"]),
                 low=float(published["low"]),
                 close=float(published["close"]),
+                prev_close=prev_close,
                 volume=float(published["volume"]),
                 amount=float(published["amount"]),
                 is_suspended=bool(published["is_suspended"]),

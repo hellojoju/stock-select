@@ -1,0 +1,6 @@
+{"payload": {"phase": "deterministic_review", "trading_date": "2026-01-13"}, "type": "init"}
+{"payload": {"reasons": ["event sources = 0"], "status": "degraded"}, "type": "availability_gate"}
+{"payload": {"review_ids": ["review_ee867abfa593", "review_83d81dca1393", "review_03584a3ad320", "review_9d2ed8d11a05", "review_54a406d89110", "review_06b6e54e3455"]}, "type": "done"}
+{"payload": {"phase": "deterministic_review", "trading_date": "2026-01-13"}, "type": "init"}
+{"payload": {"reasons": ["event sources = 0"], "status": "degraded"}, "type": "availability_gate"}
+{"payload": {"review_ids": ["review_ee867abfa593", "review_83d81dca1393", "review_03584a3ad320", "review_9d2ed8d11a05", "review_54a406d89110", "review_06b6e54e3455"]}, "type": "done"}

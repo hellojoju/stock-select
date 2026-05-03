@@ -1,7 +1,18 @@
 import { useEffect, useState } from 'react';
-import { Clock, AlertCircle, CheckCircle, RefreshCw } from 'lucide-react';
+import { Clock, AlertCircle, CheckCircle, RefreshCw, Play, Square } from 'lucide-react';
+import { API_BASE } from '../api/client';
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:18425';
+type SchedulerJob = {
+  id: string;
+  name: string;
+  next_run: string | null;
+};
+
+type SchedulerStatus = {
+  running: boolean;
+  jobs: SchedulerJob[];
+  message?: string;
+};
 
 type RunStatus = {
   run_id: string;
@@ -44,6 +55,7 @@ export default function SchedulerPanel() {
   const [dailyReport, setDailyReport] = useState<DailyReport | null>(null);
   const [recentErrors, setRecentErrors] = useState<ErrorEntry[]>([]);
   const [loading, setLoading] = useState(false);
+  const [schedulerStatus, setSchedulerStatus] = useState<SchedulerStatus | null>(null);
 
   useEffect(() => {
     void loadAll();
@@ -52,10 +64,11 @@ export default function SchedulerPanel() {
   async function loadAll() {
     setLoading(true);
     try {
-      const [runsRes, errorsRes, dashboardRunsRes] = await Promise.all([
+      const [runsRes, errorsRes, dashboardRunsRes, schedRes] = await Promise.all([
         fetch(`${API_BASE}/api/monitor/runs?limit=20`).catch(() => null),
         fetch(`${API_BASE}/api/monitor/errors`).catch(() => null),
         fetch(`${API_BASE}/api/runs?limit=20`).catch(() => null),
+        fetch(`${API_BASE}/api/scheduler/status`).catch(() => null),
       ]);
       if (runsRes?.ok) setRuns(await runsRes.json().catch(() => []));
       if (errorsRes?.ok) setRecentErrors(await errorsRes.json().catch(() => []));
@@ -65,9 +78,20 @@ export default function SchedulerPanel() {
           setDate(runsData[0].trading_date);
         }
       }
+      if (schedRes?.ok) setSchedulerStatus(await schedRes.json());
     } finally {
       setLoading(false);
     }
+  }
+
+  async function startScheduler() {
+    await fetch(`${API_BASE}/api/scheduler/start`, { method: 'POST' });
+    await loadAll();
+  }
+
+  async function stopScheduler() {
+    await fetch(`${API_BASE}/api/scheduler/stop`, { method: 'POST' });
+    await loadAll();
   }
 
   async function loadDailyReport(targetDate = date) {
@@ -89,11 +113,39 @@ export default function SchedulerPanel() {
       <header className="panel-header">
         <h2>调度监控</h2>
         <div className="actions">
+          {schedulerStatus && (
+            <div className="scheduler-status-badge">
+              <span className={schedulerStatus.running ? 'ok' : 'error'}>
+                {schedulerStatus.running ? '运行中' : '已停止'}
+              </span>
+              {schedulerStatus.running ? (
+                <button onClick={stopScheduler} className="btn-stop"><Square size={14} /> 停止</button>
+              ) : (
+                <button onClick={startScheduler} className="btn-start"><Play size={14} /> 启动</button>
+              )}
+            </div>
+          )}
           <input value={date} onChange={(e) => setDate(e.target.value)} placeholder="YYYY-MM-DD" />
           <button onClick={() => loadDailyReport(date)} disabled={!date || loading}>日报</button>
           <button onClick={loadAll}><RefreshCw size={16} /> 刷新</button>
         </div>
       </header>
+
+      {schedulerStatus && schedulerStatus.jobs.length > 0 && (
+        <section className="scheduler-jobs">
+          <h3>定时任务</h3>
+          <div className="job-list">
+            {schedulerStatus.jobs.map((job) => (
+              <div className="job-item" key={job.id}>
+                <span className="job-id">{job.id}</span>
+                <span className="job-next">
+                  {job.next_run ? `下次运行: ${job.next_run}` : '未调度'}
+                </span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       <section className="phase-grid">
         {PHASES.map((phase) => {

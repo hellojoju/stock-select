@@ -1,6 +1,7 @@
 """Pick Evaluator: score and rank pre-open picks against plan and history."""
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -117,9 +118,66 @@ def rank_candidates(
 
 
 def run_evaluation(conn: sqlite3.Connection, trading_date: str) -> dict[str, Any]:
-    """Run full evaluation of pre-open candidates."""
+    """Run full evaluation of pre-open candidates and persist to pick_evaluations."""
     plan = plan_preopen_focus(conn, trading_date)
     candidates = rank_candidates(conn, trading_date, min_score=0.0, limit=20)
+
+    plan_focus_industries = {s.get("industry") for s in plan.get("focus_sectors", [])}
+
+    # Evaluate actual picks for the day
+    actual_picks = conn.execute(
+        "SELECT decision_id, stock_code, strategy_gene_id FROM pick_decisions WHERE trading_date = ? AND action = 'BUY'",
+        (trading_date,),
+    ).fetchall()
+
+    evaluated_count = 0
+    for pick in actual_picks:
+        stock = conn.execute("SELECT name, industry FROM stocks WHERE stock_code = ?", (pick["stock_code"],)).fetchone()
+        score_obj = evaluate_candidate(conn, pick["stock_code"], trading_date)
+        outcome = conn.execute(
+            "SELECT return_pct FROM outcomes WHERE decision_id = ?",
+            (pick["decision_id"],),
+        ).fetchone()
+
+        return_pct = float(outcome["return_pct"]) if outcome else 0.0
+        verdict = "win" if return_pct > 0 else "loss"
+        planner_aligned = 1 if stock and stock["industry"] in plan_focus_industries else 0
+
+        evaluation_id = "eval_" + hashlib.sha1(
+            f"{pick['decision_id']}:evaluation".encode()
+        ).hexdigest()[:12]
+
+        conn.execute(
+            """
+            INSERT INTO pick_evaluations(
+              evaluation_id, decision_id, trading_date, stock_code, strategy_gene_id,
+              return_pct, verdict, thesis_quality,
+              planner_aligned, notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(decision_id) DO UPDATE SET
+              return_pct = excluded.return_pct,
+              verdict = excluded.verdict,
+              thesis_quality = excluded.thesis_quality,
+              planner_aligned = excluded.planner_aligned,
+              notes = excluded.notes
+            """,
+            (
+                evaluation_id,
+                pick["decision_id"],
+                trading_date,
+                pick["stock_code"],
+                pick["strategy_gene_id"],
+                return_pct,
+                verdict,
+                score_obj.overall_score,
+                planner_aligned,
+                score_obj.notes,
+            ),
+        )
+        evaluated_count += 1
+
+    conn.commit()
 
     result = {
         "trading_date": trading_date,
@@ -135,6 +193,7 @@ def run_evaluation(conn: sqlite3.Connection, trading_date: str) -> dict[str, Any
             }
             for s in candidates[:10]
         ],
+        "actual_picks_evaluated": evaluated_count,
         "total_evaluated": len(candidates),
     }
 

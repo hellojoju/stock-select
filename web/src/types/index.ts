@@ -24,8 +24,30 @@ export type Dashboard = {
   data_status?: Array<Record<string, string | number | null>>;
   data_quality_summary?: Record<string, unknown>;
   evidence_status?: EvidenceStatus;
+  llm_status?: LLMStatus;
   candidate_scores: Array<Record<string, string | number>>;
   review_summary?: Record<string, unknown>;
+};
+
+export type LLMStatus = {
+  state: 'Ready' | 'Off' | 'Error' | string;
+  configured: boolean;
+  ready: boolean;
+  provider?: string | null;
+  model?: string | null;
+  last_status?: string | null;
+  last_error?: string | null;
+  last_run_at?: string | null;
+};
+
+export type Availability = {
+  date: string;
+  status: 'ok' | 'degraded' | 'failed';
+  price_coverage_pct: number;
+  pick_count: number;
+  event_source_count: number;
+  review_evidence_count: number;
+  reasons: string[];
 };
 
 export type Comparison = {
@@ -38,7 +60,56 @@ export type Comparison = {
   parameter_diff?: Array<Record<string, unknown>>;
   aggregated_signals?: Array<Record<string, unknown>>;
   evidence_ids?: string[];
-  promotion_eligible?: boolean;
+  promotion_eligible?: boolean | Record<string, unknown>;
+};
+
+export type PromotionCriteria = {
+  name: string;
+  label: string;
+  pass: boolean;
+  value: number | string;
+  threshold?: number;
+};
+
+export type PromotionEligibility = {
+  eligible: boolean;
+  criteria: PromotionCriteria[];
+  performance: Record<string, unknown>;
+};
+
+export type SignalDetail = {
+  signal_id: string;
+  source_type: string;
+  source_id: string;
+  target_gene_id: string | null;
+  scope: string;
+  scope_key: string | null;
+  signal_type: string;
+  param_name: string;
+  direction: string;
+  strength: number;
+  confidence: number;
+  sample_size: number;
+  status: string;
+  reason: string;
+  evidence_ids: string[];
+  source_detail?: Record<string, unknown> | null;
+  evidence_details?: Array<Record<string, unknown>>;
+  created_at?: string;
+};
+
+export type RollbackEvent = {
+  event_id: string;
+  parent_gene_id: string;
+  child_gene_id: string | null;
+  period_start: string;
+  period_end: string;
+  rolled_back_at: string | null;
+  created_at: string;
+  reason: string;
+  parent_performance: Record<string, unknown>;
+  child_performance: Record<string, unknown> | null;
+  parameter_diff: Array<Record<string, unknown>>;
 };
 
 export type EvidenceStatus = {
@@ -89,6 +160,7 @@ export type LLMReview = {
     completion_tokens: number;
     estimated_cost: number;
   };
+  evidence_references?: Array<Record<string, unknown>>;
 };
 
 /* === Stock Review Detail === */
@@ -100,6 +172,9 @@ export type FactorItem = {
   error_type: string | null;
   confidence: string;
   evidence_ids: string[];
+  actual?: Record<string, unknown>;
+  reason?: string;
+  expected?: Record<string, unknown>;
 };
 
 export type ReviewError = {
@@ -144,7 +219,7 @@ export type AnalystReview = {
 
 export type ReviewDecision = {
   review_id: string;
-  decision_id: string;
+  decision_id: string | null;
   strategy_gene_id: string;
   stock_code: string;
   verdict: string;
@@ -157,4 +232,93 @@ export type ReviewDecision = {
   evidence: ReviewEvidence[];
   optimization_signals: ReviewSignal[];
   llm_json?: string;
+};
+
+export type StockReviewResponse = {
+  stock: Record<string, unknown>;
+  trading_date: string;
+  decisions: ReviewDecision[];
+  blindspot: Record<string, unknown> | null;
+  domain_facts: Record<string, Array<Record<string, unknown>>>;
+  graph_context?: Record<string, unknown>;
+  evidence_timeline?: Record<string, unknown>;
+  hypothetical?: boolean;
+};
+
+/* === Announcement Hunter === */
+
+export type AlertType = 'earnings_beat' | 'large_order' | 'tech_breakthrough' | 'asset_injection' | 'm_and_a';
+export type AlertStatus = 'new' | 'acknowledged' | 'dismissed';
+export type OpportunityType = 'sector_leader' | 'breakout' | 'event_driven';
+
+export type AnnouncementAlert = {
+  alert_id: string;
+  trading_date: string;
+  discovered_at: string;
+  stock_code: string;
+  stock_name?: string | null;
+  industry?: string | null;
+  source: string;
+  alert_type: AlertType;
+  title: string;
+  summary?: string | null;
+  source_url?: string | null;
+  event_ids_json?: string | null;
+  sentiment_score: number;
+  capital_flow_score?: number | null;
+  sector_heat_score?: number | null;
+  chip_structure_score?: number | null;
+  shareholder_trend_score?: number | null;
+  capital_flow_evidence?: string | null;
+  sector_heat_evidence?: string | null;
+  chip_structure_evidence?: string | null;
+  shareholder_trend_evidence?: string | null;
+  confidence: number;
+  status: AlertStatus;
+  created_at: string;
+};
+
+export type MonitorRun = {
+  run_id: string;
+  started_at: string;
+  finished_at?: string | null;
+  source: string;
+  documents_fetched: number;
+  new_documents: number;
+  alerts_generated: number;
+  error?: string | null;
+  status: string;
+};
+
+export type SectorHeatItem = {
+  trading_date: string;
+  industry: string;
+  heat_score: number;
+  stock_count: number;
+  limit_up_count: number;
+  total_flow?: number | null;
+  announcement_count: number;
+  composite_return_pct?: number | null;
+  computed_at: string;
+};
+
+export type LiveStats = {
+  date: string | null;
+  total: number;
+  by_type: Record<string, number>;
+  max_score: number;
+  new_count: number;
+};
+
+export type AnnouncementEvent = {
+  type: 'new_alert';
+  alert: {
+    alert_id: string;
+    stock_code: string;
+    stock_name?: string;
+    alert_type: AlertType;
+    title: string;
+    sentiment_score: number;
+    discovered_at: string;
+  };
 };

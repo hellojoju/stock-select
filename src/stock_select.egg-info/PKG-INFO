@@ -3,6 +3,10 @@ Name: stock-select
 Version: 0.1.0
 Summary: Self-evolving A-share stock selection research system.
 Requires-Python: >=3.11
+Requires-Dist: anthropic>=0.97.0
+Requires-Dist: apscheduler>=3.11.2
+Requires-Dist: openai>=2.32.0
+Requires-Dist: python-dotenv>=1.2.2
 Provides-Extra: api
 Requires-Dist: fastapi>=0.115; extra == "api"
 Requires-Dist: pydantic>=2.8; extra == "api"

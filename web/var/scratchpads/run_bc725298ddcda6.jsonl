@@ -1,0 +1,6 @@
+{"payload": {"phase": "preopen_pick", "trading_date": "2026-01-14"}, "type": "init"}
+{"payload": {"reasons": ["event sources = 0", "review evidence = 0"], "status": "degraded"}, "type": "availability_gate"}
+{"payload": {"decision_ids": ["pick_8a6e458d36f2", "pick_2e12886286be", "pick_a4a025482f05", "pick_703bdb8052d9", "pick_bec3dc56b449", "pick_640be229eb6e", "pick_3d2194829215", "pick_763024207ef4"], "planner_plan": {"focus_sectors": [], "high_impact_events": [], "llm_notes": null, "market_environment": {"market_environment": "unknown", "trend_type": "unknown", "volatility_level": "unknown"}, "trading_date": "2026-01-14", "watch_risks": []}}, "type": "done"}
+{"payload": {"phase": "preopen_pick", "trading_date": "2026-01-14"}, "type": "init"}
+{"payload": {"reasons": ["event sources = 0", "review evidence = 0"], "status": "degraded"}, "type": "availability_gate"}
+{"payload": {"decision_ids": ["pick_8a6e458d36f2", "pick_2e12886286be", "pick_a4a025482f05", "pick_703bdb8052d9", "pick_bec3dc56b449", "pick_640be229eb6e", "pick_3d2194829215", "pick_763024207ef4"], "planner_plan": {"focus_sectors": [], "high_impact_events": [], "llm_notes": null, "market_environment": {"market_environment": "unknown", "trend_type": "unknown", "volatility_level": "unknown"}, "trading_date": "2026-01-14", "watch_risks": []}}, "type": "done"}

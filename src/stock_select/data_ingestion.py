@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import socket
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -541,27 +544,36 @@ class AkShareProvider:
         except Exception as exc:  # pragma: no cover - depends on optional package
             raise RuntimeError("akshare is not installed") from exc
 
-        rows: list[SourcePrice] = []
         date_token = trading_date.replace("-", "")
-        for stock_code in stock_codes:
-            symbol = stock_code.split(".")[0]
-            frame = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=date_token, end_date=date_token)
+
+        def _fetch_one(code: str) -> SourcePrice | None:
+            suffix = code.split(".")[-1]
+            tx_prefix = {"SH": "sh", "SZ": "sz", "BJ": "bj"}.get(suffix, "sh")
+            symbol = f"{tx_prefix}{code.split('.')[0]}"
+            try:
+                frame = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=date_token, end_date=date_token)
+            except Exception:
+                return None
             if frame.empty:
-                continue
+                return None
             item = frame.iloc[0]
-            rows.append(
-                SourcePrice(
-                    source=self.source,
-                    stock_code=stock_code,
-                    trading_date=trading_date,
-                    open=float(value_from(item, "开盘", "open")),
-                    high=float(value_from(item, "最高", "high")),
-                    low=float(value_from(item, "最低", "low")),
-                    close=float(value_from(item, "收盘", "close")),
-                    volume=float(value_from(item, "成交量", "volume") or 0),
-                    amount=float(value_from(item, "成交额", "amount") or 0),
-                )
+            return SourcePrice(
+                source=self.source,
+                stock_code=code,
+                trading_date=trading_date,
+                open=float(value_from(item, "开盘", "open")),
+                high=float(value_from(item, "最高", "high")),
+                low=float(value_from(item, "最低", "low")),
+                close=float(value_from(item, "收盘", "close")),
+                volume=0.0,
+                amount=float(value_from(item, "成交额", "amount") or 0),
             )
+
+        rows: list[SourcePrice] = []
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for result in pool.map(_fetch_one, stock_codes):
+                if result is not None:
+                    rows.append(result)
         return rows
 
     def fetch_index_prices(self, trading_date: str, index_codes: list[str]) -> list[SourceIndexPrice]:
@@ -573,7 +585,10 @@ class AkShareProvider:
         rows: list[SourceIndexPrice] = []
         for index_code in index_codes:
             symbol = to_akshare_index_code(index_code)
-            frame = ak.stock_zh_index_daily_em(symbol=symbol)
+            try:
+                frame = ak.stock_zh_a_hist_tx(symbol=symbol)
+            except Exception:
+                continue
             if frame.empty:
                 continue
             date_column = "date" if "date" in frame.columns else "日期"
@@ -590,7 +605,7 @@ class AkShareProvider:
                     high=float(value_from(item, "high", "最高")),
                     low=float(value_from(item, "low", "最低")),
                     close=float(value_from(item, "close", "收盘")),
-                    volume=float(value_from(item, "volume", "成交量") or 0),
+                    volume=0.0,
                     amount=float(value_from(item, "amount", "成交额") or 0),
                 )
             )
@@ -617,7 +632,39 @@ class AkShareProvider:
         return rows
 
     def fetch_fundamentals(self, trading_date: str, stock_codes: list[str]) -> list[FundamentalMetricItem]:
-        raise UnsupportedDatasetError("akshare fundamentals are not configured for Phase B; use baostock")
+        """S5.3: Fetch basic fundamentals from AKShare (valuation, PE, PB)."""
+        try:
+            import akshare as ak  # type: ignore[import-not-found]
+        except Exception as exc:  # pragma: no cover - depends on optional package
+            raise UnsupportedDatasetError("akshare fundamentals require akshare package") from exc
+
+        import pandas as pd  # type: ignore[import-not-found]
+
+        rows: list[FundamentalMetricItem] = []
+        captured = datetime.now(tz=__import__('datetime', fromlist=['timezone']).timezone.utc).isoformat()
+        for stock_code in stock_codes:
+            try:
+                # AKShare stock individual info
+                ak_code = stock_code
+                info = ak.stock_individual_info_em(symbol=ak_code)
+                if not isinstance(info, pd.DataFrame) or info.empty:
+                    continue
+                info_dict = dict(zip(info["item"], info["value"]))
+                rows.append(FundamentalMetricItem(
+                    source=self.source,
+                    stock_code=stock_code,
+                    as_of_date=trading_date,
+                    report_period=trading_date,
+                    pe_percentile=safe_float(info_dict.get("市盈率")),
+                    quality_note="akshare stock_individual_info_em: " + json.dumps(
+                        {k: str(v) for k, v in info_dict.items()},
+                        ensure_ascii=False,
+                    )[:500],
+                ))
+            except Exception:
+                continue  # Skip individual stock failures
+
+        return rows
 
     def fetch_event_signals(self, start: str, end: str, stock_codes: list[str]) -> list[EventSignalItem]:
         try:
@@ -660,7 +707,71 @@ class AkShareProvider:
         raise UnsupportedDatasetError("akshare financial_actuals are not configured; use baostock")
 
     def fetch_analyst_expectations(self, trading_date: str, stock_codes: list[str]) -> list[AnalystExpectationItem]:
-        raise UnsupportedDatasetError("akshare analyst_expectations are not configured")
+        """Fetch analyst profit forecasts and ratings from EastMoney via AKShare."""
+        try:
+            import akshare as ak  # type: ignore[import-not-found]
+        except Exception as exc:  # pragma: no cover - depends on optional package
+            raise RuntimeError("akshare is not installed") from exc
+
+        rows: list[AnalystExpectationItem] = []
+        for stock_code in stock_codes:
+            try:
+                frame = ak.stock_research_report_em(symbol=stock_code)
+            except Exception:
+                continue
+            if frame is None or frame.empty:
+                continue
+            for _, item in frame.iterrows():
+                report_date = normalize_date(value_from(item, "日期", "report_date", "发布日期"))
+                if not report_date:
+                    continue
+                title = str(value_from(item, "报告名称", "title") or "")
+                rating = str(value_from(item, "东财评级", "rating") or "") or None
+                org_name = str(value_from(item, "机构", "org_name", "研究机构") or "") or None
+                pdf_link = str(value_from(item, "报告PDF链接", "pdf_url", "pdf_link") or "") or None
+
+                # Multi-year forecasts: columns like "2025-盈利预测-收益"
+                year_cols = []
+                for col in frame.columns:
+                    if "盈利预测-收益" in str(col):
+                        try:
+                            year = int(str(col).split("-")[0])
+                            year_cols.append(year)
+                        except ValueError:
+                            continue
+
+                for year in sorted(year_cols):
+                    eps_col = f"{year}-盈利预测-收益"
+                    pe_col = f"{year}-盈利预测-市盈率"
+                    eps_raw = value_from(item, eps_col)
+                    pe_raw = value_from(item, pe_col)
+                    forecast_eps = safe_float(eps_raw)
+                    forecast_pe = safe_float(pe_raw)
+                    if forecast_eps is None and forecast_pe is None:
+                        continue
+
+                    forecast_period = f"{year}-12-31"
+                    rows.append(
+                        AnalystExpectationItem(
+                            source=self.source,
+                            stock_code=stock_code,
+                            report_date=report_date,
+                            forecast_period=forecast_period,
+                            org_name=org_name,
+                            report_title=title or None,
+                            forecast_eps=forecast_eps,
+                            forecast_pe=forecast_pe,
+                            rating=rating,
+                            source_url=pdf_link or None,
+                            source_fetched_at=datetime.now().isoformat(),
+                            confidence=0.85,
+                            raw_json={
+                                "source_api": "stock_research_report_em",
+                                "industry": str(value_from(item, "行业", "industry") or ""),
+                            },
+                        )
+                    )
+        return rows
 
     def fetch_order_contract_events(self, start: str, end: str, stock_codes: list[str]) -> list[OrderContractEventItem]:
         notices = self._fetch_notice_rows(start, end, stock_codes)
@@ -983,7 +1094,10 @@ class BaoStockProvider:
                 raise RuntimeError(login.error_msg)
             try:
                 for stock_code in stock_codes:
-                    bs_code = to_baostock_code(stock_code)
+                    try:
+                        bs_code = to_baostock_code(stock_code)
+                    except ValueError:
+                        continue
                     for year, quarter in candidates:
                         profit = baostock_query_first(bs.query_profit_data(bs_code, year=year, quarter=quarter))
                         if not profit:
@@ -1022,7 +1136,50 @@ class BaoStockProvider:
         return rows
 
     def fetch_event_signals(self, start: str, end: str, stock_codes: list[str]) -> list[EventSignalItem]:
-        return []
+        """Fetch event signals from CNINFO (巨潮资讯网), independent of East Money."""
+        try:
+            import akshare as ak  # type: ignore[import-not-found]
+        except Exception as e:
+            logger.warning("BaoStock event fallback skipped: akshare not available (%s)", e)
+            return []
+
+        import pandas as pd  # type: ignore[import-not-found]
+
+        rows: list[EventSignalItem] = []
+        cninfo_start = start.replace("-", "")
+        cninfo_end = end.replace("-", "")
+        for stock_code in stock_codes:
+            try:
+                frame = ak.stock_zh_a_disclosure_report_cninfo(
+                    symbol=stock_code.split(".")[0],
+                    start_date=cninfo_start,
+                    end_date=cninfo_end,
+                )
+            except Exception:
+                continue
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                continue
+            for _, item in frame.iterrows():
+                title = str(item.get("公告标题") or "")
+                if not title:
+                    continue
+                published_at = normalize_date(str(item.get("公告时间") or ""))
+                if not published_at:
+                    continue
+                event_type, impact, sentiment = classify_event_title(title)
+                rows.append(EventSignalItem(
+                    source=self.source,
+                    event_id=event_signal_id(self.source, published_at, stock_code, event_type, title),
+                    trading_date=published_at,
+                    published_at=published_at,
+                    event_type=event_type,
+                    title=title[:200],
+                    summary=title[:500],
+                    stock_code=stock_code,
+                    impact_score=impact,
+                    sentiment=sentiment,
+                ))
+        return rows
 
     def fetch_financial_actuals(self, trading_date: str, stock_codes: list[str]) -> list[FinancialActualItem]:
         try:
@@ -1037,7 +1194,10 @@ class BaoStockProvider:
                 raise RuntimeError(login.error_msg)
             try:
                 for stock_code in stock_codes:
-                    bs_code = to_baostock_code(stock_code)
+                    try:
+                        bs_code = to_baostock_code(stock_code)
+                    except ValueError:
+                        continue
                     for year, quarter in candidates:
                         profit = baostock_query_first(bs.query_profit_data(bs_code, year=year, quarter=quarter))
                         if not profit:
@@ -1085,6 +1245,13 @@ class BaoStockProvider:
         raise UnsupportedDatasetError("baostock risk_events are not configured")
 
 
+def sync_market_breadth(conn: sqlite3.Connection, trading_date: str) -> dict:
+    """Sync full-market breadth data (advance/decline counts, limits, indices)."""
+    from .market_breadth import ensure_market_breadth
+
+    return ensure_market_breadth(conn, trading_date)
+
+
 def sync_all_data(
     conn: sqlite3.Connection,
     trading_date: str,
@@ -1096,6 +1263,7 @@ def sync_all_data(
         "trading_calendar": sync_trading_calendar(conn, start, trading_date, providers=providers),
         "daily_prices": sync_daily_prices(conn, trading_date, providers=providers),
         "index_prices": sync_index_prices(conn, trading_date, providers=providers),
+        "market_breadth": sync_market_breadth(conn, trading_date),
         "canonical_prices": publish_canonical_prices(conn, trading_date),
         "market_environment": classify_market_environment(conn, trading_date),
     }
@@ -1674,7 +1842,7 @@ def liquid_stock_codes_before(
 ) -> list[str]:
     price_date = previous_price_date(conn, trading_date)
     if price_date is None:
-        codes = repository.active_stock_codes(conn)
+        codes = [c for c in (normalize_stock_code(c) for c in repository.active_stock_codes(conn)) if c is not None]
         return apply_stock_window(codes, offset=offset, limit=limit)
     query_limit = -1 if limit is None else limit
     rows = conn.execute(
@@ -1690,7 +1858,12 @@ def liquid_stock_codes_before(
         """,
         (price_date, query_limit, offset),
     ).fetchall()
-    return [row["stock_code"] for row in rows]
+    codes: list[str] = []
+    for row in rows:
+        normalized = normalize_stock_code(row["stock_code"])
+        if normalized:
+            codes.append(normalized)
+    return codes
 
 
 def fundamental_stock_codes_before(
@@ -2064,6 +2237,19 @@ def classify_market_environment(
             market_environment="unknown",
         )
         conn.commit()
+
+        # Write unknown to market_environment_logs too
+        import hashlib as _hash
+        log_id = "mel_" + _hash.sha1(f"market_env_{trading_date}".encode()).hexdigest()[:12]
+        try:
+            conn.execute(
+                "INSERT INTO market_environment_logs(log_id, trading_date, market_environment, trend_type, volatility_level, breadth_up_count, breadth_down_count, limit_up_count, limit_down_count) VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0)",
+                (log_id, trading_date, "unknown", "unknown", "unknown"),
+            )
+            conn.commit()
+        except Exception:
+            pass
+
         return {"market_environment": "unknown", "reason": "insufficient index history", "history_days": len(rows)}
     ordered = list(rows)[::-1]
     closes = [float(row["close"]) for row in ordered]
@@ -2090,6 +2276,40 @@ def classify_market_environment(
         index_return_pct=period_return,
     )
     conn.commit()
+
+    # Write to market_environment_logs for environment-layered tracking
+    breadth = conn.execute(
+        "SELECT advance_count, decline_count, limit_up_count, limit_down_count FROM market_overview_daily WHERE trading_date = ?",
+        (trading_date,),
+    ).fetchone()
+    breadth_up = breadth["advance_count"] if breadth else 0
+    breadth_down = breadth["decline_count"] if breadth else 0
+    limit_up = breadth["limit_up_count"] if breadth else 0
+    limit_down = breadth["limit_down_count"] if breadth else 0
+
+    import hashlib as _hash
+    log_id = "mel_" + _hash.sha1(f"market_env_{trading_date}".encode()).hexdigest()[:12]
+    conn.execute(
+        """
+        INSERT INTO market_environment_logs(
+          log_id, trading_date, market_environment, trend_type, volatility_level,
+          breadth_up_count, breadth_down_count, limit_up_count, limit_down_count
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(trading_date) DO UPDATE SET
+          market_environment = excluded.market_environment,
+          trend_type = excluded.trend_type,
+          volatility_level = excluded.volatility_level,
+          breadth_up_count = excluded.breadth_up_count,
+          breadth_down_count = excluded.breadth_down_count,
+          limit_up_count = excluded.limit_up_count,
+          limit_down_count = excluded.limit_down_count
+        """,
+        (log_id, trading_date, environment, trend_type, volatility_level,
+         breadth_up, breadth_down, limit_up, limit_down),
+    )
+    conn.commit()
+
     return {
         "market_environment": environment,
         "trend_type": trend_type,
@@ -2188,14 +2408,19 @@ def fetch_daily_prices_range_with_retries(
     raise last_error
 
 
+_socket_timeout_lock = threading.Lock()
+
+
 @contextmanager
 def default_socket_timeout(seconds: float):
     previous = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(seconds)
+    with _socket_timeout_lock:
+        socket.setdefaulttimeout(seconds)
     try:
         yield
     finally:
-        socket.setdefaulttimeout(previous)
+        with _socket_timeout_lock:
+            socket.setdefaulttimeout(previous)
 
 
 def normalize_stock_code(raw_code: str) -> str | None:
@@ -2221,16 +2446,22 @@ def exchange_for_code(stock_code: str) -> str:
 
 
 def to_baostock_code(stock_code: str) -> str:
+    if "." not in stock_code:
+        raise ValueError(f"Invalid stock_code format: {stock_code!r}, expected format 'CODE.EXCHANGE'")
     code, exchange = stock_code.split(".")
     return f"{exchange.lower()}.{code}"
 
 
 def from_baostock_code(code: str) -> str:
+    if "." not in code:
+        raise ValueError(f"Invalid baostock code format: {code!r}, expected format 'exchange.digits'")
     exchange, digits = code.split(".")
     return f"{digits}.{exchange.upper()}"
 
 
 def is_a_share_stock_code(stock_code: str) -> bool:
+    if "." not in stock_code:
+        return False
     code, exchange = stock_code.split(".")
     if exchange == "SH":
         return code.startswith(("6", "9"))
@@ -2289,13 +2520,15 @@ def conservative_visible_date(report_period: str, published_at: str | None) -> s
 
 
 def safe_float(value: Any) -> float | None:
+    import math
     if value is None:
         return None
     text = str(value).strip()
     if not text:
         return None
     try:
-        return float(text)
+        v = float(text)
+        return None if math.isnan(v) else v
     except ValueError:
         return None
 

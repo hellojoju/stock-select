@@ -33,8 +33,12 @@ def rank_candidates_for_gene(
         "DELETE FROM candidate_scores WHERE trading_date = ? AND strategy_gene_id = ?",
         (trading_date, gene_id),
     )
+
+    # Read planner focus sectors for bonus scoring
+    focus_industries = _get_focus_industries(conn, trading_date)
+
     for stock_code in repository.active_stock_codes(conn):
-        candidate = build_candidate(conn, trading_date, gene_id, stock_code, params)
+        candidate = build_candidate(conn, trading_date, gene_id, stock_code, params, focus_industries=focus_industries)
         if candidate is not None:
             candidates.append(candidate)
             repository.upsert_candidate_score(
@@ -62,6 +66,8 @@ def build_candidate(
     gene_id: str,
     stock_code: str,
     params: dict[str, Any],
+    *,
+    focus_industries: set[str] | None = None,
 ) -> Candidate | None:
     lookback = int(params.get("lookback_days", 6))
     history = repository.price_history_before(conn, stock_code, trading_date, lookback)
@@ -91,6 +97,16 @@ def build_candidate(
     fundamental = fundamental_signal(fundamentals)
     sector = repository.latest_sector_signal_before(conn, industry, trading_date)
     sector_sig = sector_signal(sector)
+
+    # Factor config filtering (Phase 3: gene strategy rules)
+    factor_config = params.get("factor_config")
+    if factor_config:
+        min_tech = factor_config.get("min_technical_score", 0.0)
+        if min_tech > 0 and technical["score"] < min_tech:
+            return None
+        min_fund = factor_config.get("min_fundamental_score", 0.0)
+        if min_fund > 0 and fundamental["score"] < min_fund:
+            return None
     events = repository.recent_events_before(
         conn,
         trading_date=trading_date,
@@ -101,12 +117,57 @@ def build_candidate(
     event_sig = event_signal(events)
     risk = risk_signal(avg_amount, technical["volatility"], fundamentals, events)
 
+    list_date = stock["list_date"] if stock is not None and "list_date" in stock.keys() else None
+    listing_days = listed_days(list_date, trading_date) if list_date else None
+    hard_filters = [
+        {
+            "name": "listing_status",
+            "status": "pass",
+            "reason": "股票在交易日历中",
+            "source": "stocks.listing_status",
+            "as_of_date": trading_date,
+        },
+        {
+            "name": "not_st",
+            "status": "pass",
+            "reason": "非 ST 股票",
+            "source": "stocks.is_st",
+            "as_of_date": trading_date,
+        },
+        {
+            "name": "not_suspended",
+            "status": "pass",
+            "reason": "最近两日未停牌",
+            "source": "daily_prices.is_suspended",
+            "as_of_date": trading_date,
+        },
+        {
+            "name": "listing_days",
+            "status": "pass",
+            "reason": f"已上市 {listing_days if listing_days is not None else '未知'} 天",
+            "source": "stocks.list_date",
+            "as_of_date": trading_date,
+        },
+        {
+            "name": "min_avg_amount",
+            "status": "pass",
+            "reason": f"近5日平均成交额 {avg_amount:,.0f} >= {float(params.get('min_avg_amount', 0)):,.0f}",
+            "source": "daily_prices.amount",
+            "as_of_date": trading_date,
+        },
+    ]
+
+    planner_bonus = 0.0
+    if focus_industries and industry in focus_industries:
+        planner_bonus = 0.05  # 5% bonus for planner focus sectors
+
     total_score = (
         technical["score"] * float(params.get("technical_component_weight", 0.45))
         + fundamental["score"] * float(params.get("fundamental_component_weight", 0.2))
         + event_sig["score"] * float(params.get("event_component_weight", 0.2))
         + sector_sig["score"] * float(params.get("sector_component_weight", 0.15))
         - risk["score"] * float(params.get("risk_component_weight", 0.3))
+        + planner_bonus
     )
     confidence = clamp(0.35 + abs(total_score) * 0.8 + coverage_bonus(fundamentals, sector, events), 0.05, 0.95)
     packet = {
@@ -146,6 +207,8 @@ def build_candidate(
             ],
         },
         "missing_fields": missing_fields(fundamentals, sector, events),
+        "data_coverage": data_coverage_detail(fundamentals, sector, events),
+        "hard_filters": hard_filters,
     }
     return Candidate(
         stock_code=stock_code,
@@ -298,6 +361,19 @@ def diversity_rerank(candidates: list[Candidate], max_per_industry: int) -> list
     return primary + overflow
 
 
+def _get_focus_industries(conn: sqlite3.Connection, trading_date: str) -> set[str]:
+    """Extract focus industries from today's planner plan."""
+    row = conn.execute(
+        "SELECT focus_sectors_json FROM planner_plans WHERE trading_date = ?",
+        (trading_date,),
+    ).fetchone()
+    if not row or not row["focus_sectors_json"]:
+        return set()
+    import json
+    focus_sectors = json.loads(row["focus_sectors_json"])
+    return {s["industry"] for s in focus_sectors if isinstance(s, dict) and "industry" in s}
+
+
 def candidate_id(trading_date: str, gene_id: str, stock_code: str) -> str:
     raw = f"{trading_date}:{gene_id}:{stock_code}"
     return "cand_" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
@@ -333,14 +409,22 @@ def clamp(value: float, lower: float, upper: float) -> float:
 
 
 def coverage_bonus(fundamentals: sqlite3.Row | None, sector: sqlite3.Row | None, events: list[sqlite3.Row]) -> float:
+    """S5.5: Bonus for having data, penalty for missing data."""
     bonus = 0.0
+    penalty = 0.0
     if fundamentals is not None:
-        bonus += 0.08
+        bonus += 0.06
+    else:
+        penalty += 0.05
     if sector is not None:
-        bonus += 0.05
+        bonus += 0.04
+    else:
+        penalty += 0.03
     if events:
-        bonus += 0.05
-    return bonus
+        bonus += 0.04
+    else:
+        penalty += 0.03
+    return bonus - penalty
 
 
 def listed_days(list_date: str, trading_date: str) -> int:
@@ -357,6 +441,7 @@ def missing_fields(
     sector: sqlite3.Row | None,
     events: list[sqlite3.Row],
 ) -> list[str]:
+    """Return list of missing data dimensions for the candidate."""
     missing = []
     if fundamentals is None:
         missing.append("fundamental")
@@ -365,6 +450,19 @@ def missing_fields(
     if not events:
         missing.append("event")
     return missing
+
+
+def data_coverage_detail(
+    fundamentals: sqlite3.Row | None,
+    sector: sqlite3.Row | None,
+    events: list[sqlite3.Row],
+) -> dict[str, str]:
+    """S5.6: Detailed data coverage status for each dimension."""
+    return {
+        "fundamental": "available" if fundamentals else "data_missing",
+        "sector": "available" if sector else "data_missing",
+        "event": "available" if events else "data_missing",
+    }
 
 
 def factor_source(

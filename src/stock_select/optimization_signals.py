@@ -239,3 +239,138 @@ def flatten(values: list[Any]) -> list[Any]:
         else:
             output.append(value)
     return output
+
+
+def signal_detail(
+    conn: sqlite3.Connection,
+    signal_id: str,
+) -> dict[str, Any] | None:
+    """S6.1: Return full signal details with source review and evidence context."""
+    row = conn.execute(
+        "SELECT * FROM optimization_signals WHERE signal_id = ?", (signal_id,)
+    ).fetchone()
+    if row is None:
+        return None
+
+    result: dict[str, Any] = dict(row)
+    result["evidence_ids"] = repository.loads(row["evidence_ids_json"], [])
+
+    source_type = row["source_type"]
+    source_id = row["source_id"]
+    source_detail = _fetch_source_detail(conn, source_type, source_id)
+    result["source_detail"] = source_detail
+
+    evidence_details = _fetch_evidence_details(conn, result["evidence_ids"])
+    result["evidence_details"] = evidence_details
+
+    return result
+
+
+def _fetch_source_detail(conn: sqlite3.Connection, source_type: str, source_id: str) -> dict[str, Any] | None:
+    """Fetch the review record that generated this signal."""
+    if source_type == "decision_review":
+        row = conn.execute(
+            """
+            SELECT dr.review_id, dr.decision_id, dr.trading_date, dr.verdict,
+                   dr.return_pct, dr.primary_driver, dr.summary,
+                   pd.stock_code, pd.strategy_gene_id
+            FROM decision_reviews dr
+            JOIN pick_decisions pd ON pd.decision_id = dr.decision_id
+            WHERE dr.review_id = ?
+            """,
+            (source_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    if source_type == "blindspot_review":
+        row = conn.execute(
+            "SELECT * FROM blindspot_reviews WHERE blindspot_review_id = ?", (source_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    if source_type == "gene_review":
+        row = conn.execute(
+            "SELECT * FROM gene_reviews WHERE gene_review_id = ?", (source_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    if source_type == "system_review":
+        row = conn.execute(
+            "SELECT * FROM system_reviews WHERE system_review_id = ?", (source_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    if source_type == "analyst_review":
+        row = conn.execute(
+            "SELECT * FROM analyst_reviews WHERE analyst_review_id = ?", (source_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    return None
+
+
+def _fetch_evidence_details(
+    conn: sqlite3.Connection,
+    evidence_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Fetch review_evidence records by evidence IDs."""
+    details: list[dict[str, Any]] = []
+    for eid in evidence_ids[:20]:
+        if eid.startswith("doc:"):
+            doc_id = eid[4:]
+            doc = conn.execute(
+                "SELECT document_id, title, source, source_type, published_at FROM raw_documents WHERE document_id = ?",
+                (doc_id,),
+            ).fetchone()
+            if doc:
+                details.append({"type": "document", "id": eid, "detail": dict(doc)})
+        elif eid.startswith("edge:"):
+            edge_id = eid[5:]
+            edge = conn.execute(
+                "SELECT edge_id, source_node_id, target_node_id, type, confidence FROM graph_edges WHERE edge_id = ?",
+                (edge_id,),
+            ).fetchone()
+            if edge:
+                details.append({"type": "graph_edge", "id": eid, "detail": dict(edge)})
+        else:
+            ev = conn.execute(
+                "SELECT evidence_id, source_type, visibility, confidence, payload_json FROM review_evidence WHERE evidence_id = ?",
+                (eid,),
+            ).fetchone()
+            if ev:
+                details.append({"type": "review_evidence", "id": eid, "detail": dict(ev)})
+    return details
+
+
+def signal_with_documents(
+    conn: sqlite3.Connection,
+    *,
+    source_type: str,
+    source_id: str,
+    target_gene_id: str | None,
+    signal_type: str,
+    param_name: str | None,
+    direction: str,
+    strength: float,
+    confidence: float,
+    reason: str,
+    document_ids: list[str] | None = None,
+    edge_ids: list[str] | None = None,
+    evidence_ids: list[str] | None = None,
+) -> str:
+    """S5.5: Create signal with associated document and graph edge IDs."""
+    all_ids = list(evidence_ids or [])
+    if document_ids:
+        all_ids.extend(f"doc:{d}" for d in document_ids)
+    if edge_ids:
+        all_ids.extend(f"edge:{e}" for e in edge_ids)
+    return upsert_optimization_signal(
+        conn,
+        source_type=source_type,
+        source_id=source_id,
+        target_gene_id=target_gene_id,
+        scope="gene",
+        scope_key=target_gene_id,
+        signal_type=signal_type,
+        param_name=param_name,
+        direction=direction,
+        strength=strength,
+        confidence=confidence,
+        reason=reason,
+        evidence_ids=all_ids,
+    )

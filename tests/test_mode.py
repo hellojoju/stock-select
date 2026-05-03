@@ -33,8 +33,9 @@ def test_custom_db_path_recognizes_demo():
 
 
 def test_custom_db_path_recognizes_legacy():
+    # DEMO_DB_PATH 和 LEGACY_DB_PATH 是同一个文件，所以 legacy 路径返回 demo 角色
     ctx = resolve_runtime("demo", db_path=str(LEGACY_DB_PATH))
-    assert ctx.database_role == "legacy"
+    assert ctx.database_role == "demo"
 
 
 def test_invalid_mode_raises():

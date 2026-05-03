@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { PlayCircle } from 'lucide-react';
-import { fetchHypotheticalReviewHistory, fetchStrategyPicksHistory } from '../api/client';
-
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:18425';
+import { API_BASE, fetchHypotheticalReviewHistory, fetchStrategyPicksHistory } from '../api/client';
 
 export default function ReviewHistoryPanel({
   date,

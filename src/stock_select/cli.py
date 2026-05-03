@@ -4,6 +4,9 @@ import argparse
 import json
 
 from .agent_runtime import run_daily_pipeline, run_phase
+from .announcement_providers import sync_announcements
+from .pdf_extractor import process_pending_announcements as _cli_process_pending
+from .source_meta import list_all_sources, get_source_meta
 from .data_ingestion import (
     AkShareProvider,
     BaoStockProvider,
@@ -17,13 +20,17 @@ from .data_ingestion import (
 from .db import connect, init_db
 from .evidence_sync import backfill_evidence_range, sync_evidence
 from .evolution import evolution_comparison, promote_challenger, propose_strategy_evolution, rollback_evolution, score_genes
-from .graph import sync_decision_graph
-from .memory import search_memory
+from .graph import sync_decision_graph, sync_review_graph, detect_communities, store_communities
+from .graph_export import process_documents, export_for_date
+from .manual_import import import_documents
+from .memory import search_memory, search_documents
+from .news_providers import store_document, query_documents
 from .runtime import resolve_runtime
 from .seed import seed_demo_data
 from .server import run_server
 from .simulator import simulate_day, summarize_performance
 from .strategies import generate_picks_for_all_genes, seed_default_genes
+from .health_check import startup_health_check
 
 
 def add_runtime_args(parser: argparse.ArgumentParser, *, root: bool = False) -> None:
@@ -84,6 +91,7 @@ def main() -> None:
             "sync_business_kpi_actuals",
             "sync_risk_events",
             "sync_evidence",
+            "process_announcements",
             "preopen_pick",
             "simulate",
             "review",
@@ -168,6 +176,35 @@ def main() -> None:
     add_runtime_args(graph)
     graph.add_argument("--date", required=True)
 
+    sync_news = subparsers.add_parser("sync-news", help="Fetch announcements and news into raw_documents")
+    add_runtime_args(sync_news)
+    sync_news.add_argument("--date", required=True)
+    sync_news.add_argument("--stock-code", help="Limit to specific stock")
+    sync_news.add_argument("--sources", default="all", help="Comma-separated: cninfo,sse,szse,eastmoney,sina,all")
+
+    process_pdfs = subparsers.add_parser("process-pdfs", help="Download PDFs, extract text, classify and persist events")
+    add_runtime_args(process_pdfs)
+    process_pdfs.add_argument("--date", required=True)
+    process_pdfs.add_argument("--limit", type=int, default=20)
+
+    import_docs = subparsers.add_parser("import-docs", help="Manually import CSV/Markdown/HTML/PDF documents")
+    add_runtime_args(import_docs)
+    import_docs.add_argument("paths", nargs="+", help="Files or directories to import")
+    import_docs.add_argument("--source", default="manual_import", help="Source label")
+    import_docs.add_argument("--date", help="Default date if not in file")
+    import_docs.add_argument("--stock-code", help="Related stock code")
+
+    extract = subparsers.add_parser("extract-knowledge", help="Process raw documents: entity linking, event classification, graph")
+    add_runtime_args(extract)
+    extract.add_argument("--date", required=True)
+    extract.add_argument("--stock-code", help="Limit to specific stock")
+    extract.add_argument("--limit", type=int, default=200)
+
+    export_graphify = subparsers.add_parser("export-graphify", help="Export graph to Graphify-compatible JSON")
+    add_runtime_args(export_graphify)
+    export_graphify.add_argument("--date", required=True)
+    export_graphify.add_argument("--output", default="var/graphify", help="Output directory")
+
     scores = subparsers.add_parser("score-genes", help="Score strategy genes over a period")
     add_runtime_args(scores)
     scores.add_argument("--start", required=True)
@@ -207,6 +244,8 @@ def main() -> None:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=18425)
 
+    list_sources_cmd = subparsers.add_parser("list-sources", help="Show configured data sources and their authorization status")
+
     args = parser.parse_args()
     runtime = resolve_runtime(args.mode or "demo", args.db)
     db_path = runtime.db_path
@@ -237,9 +276,16 @@ def main() -> None:
             )
         )
     elif args.command == "pipeline":
-        print(json.dumps(run_daily_pipeline(conn, args.date), indent=2, ensure_ascii=False))
+        health = startup_health_check(conn)
+        if not health["overall_ok"]:
+            print(f"WARNING: {health['genes_invalid']} invalid gene(s) marked inactive")
+        providers = [AkShareProvider(), BaoStockProvider()]
+        print(json.dumps(run_daily_pipeline(conn, args.date, providers=providers, runtime_mode=runtime.mode), indent=2, ensure_ascii=False))
     elif args.command == "run-phase":
-        print(json.dumps(run_phase(conn, args.phase, args.date), indent=2, ensure_ascii=False))
+        health = startup_health_check(conn)
+        if not health["overall_ok"]:
+            print(f"WARNING: {health['genes_invalid']} invalid gene(s) marked inactive")
+        print(json.dumps(run_phase(conn, args.phase, args.date, runtime_mode=runtime.mode), indent=2, ensure_ascii=False))
     elif args.command == "sync-daily-prices":
         result = sync_daily_prices(
             conn,
@@ -304,7 +350,11 @@ def main() -> None:
     elif args.command == "memory-search":
         print(json.dumps(search_memory(conn, args.query), indent=2, ensure_ascii=False))
     elif args.command == "sync-graph":
-        print(json.dumps(sync_decision_graph(conn, args.date), indent=2, ensure_ascii=False))
+        result = sync_decision_graph(conn, args.date)
+        review_result = sync_review_graph(conn, args.date)
+        result["review_nodes"] = review_result["nodes"]
+        result["review_edges"] = review_result["edges"]
+        print(json.dumps(result, indent=2, ensure_ascii=False))
     elif args.command == "score-genes":
         print(json.dumps(score_genes(conn, period_start=args.start, period_end=args.end), indent=2, ensure_ascii=False))
     elif args.command == "propose-evolution":
@@ -358,9 +408,116 @@ def main() -> None:
                 ensure_ascii=False,
             )
         )
+    elif args.command == "sync-news":
+        sources = args.sources
+        all_items = sync_announcements(stock_code=args.stock_code, date=args.date, conn=conn)
+        stored = 0
+        for item in all_items:
+            if sources != "all":
+                allowed = sources.split(",")
+                if item.source not in allowed:
+                    continue
+            doc_id = store_document(conn, item)
+            stored += 1
+        conn.commit()
+        print(json.dumps({
+            "fetched": len(all_items),
+            "stored": stored,
+            "by_source": {},
+        }, indent=2, ensure_ascii=False))
+    elif args.command == "process-pdfs":
+        from .announcement_events import process_announcement_text
+
+        processed = _cli_process_pending(conn, limit=args.limit)
+        results = []
+        for item in processed:
+            text = conn.execute(
+                "SELECT content_text FROM raw_documents WHERE document_id = ?",
+                (item["document_id"],),
+            ).fetchone()
+            if text and text["content_text"]:
+                stocks = conn.execute(
+                    "SELECT stock_code FROM document_stock_links WHERE document_id = ?",
+                    (item["document_id"],),
+                ).fetchall()
+                known_codes = [r["stock_code"] for r in stocks]
+                counts = process_announcement_text(
+                    conn, item["document_id"], text["content_text"], args.date, known_codes or None
+                )
+                results.append({
+                    "document_id": item["document_id"],
+                    "title": item["title"],
+                    "text_length": item["text_length"],
+                    "classifications": item.get("classifications", []),
+                    "extracted_events": counts,
+                })
+        print(json.dumps({
+            "processed": len(processed),
+            "with_events": len(results),
+            "details": results,
+        }, indent=2, ensure_ascii=False))
+    elif args.command == "import-docs":
+        results = import_documents(
+            conn,
+            paths=args.paths,
+            source=args.source,
+            default_date=args.date,
+            default_stock_code=args.stock_code,
+        )
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+    elif args.command == "extract-knowledge":
+        stats = process_documents(
+            conn,
+            date=args.date,
+            stock_code=args.stock_code,
+            limit=args.limit,
+        )
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
+    elif args.command == "export-graphify":
+        out_path = export_for_date(conn, date=args.date, output_dir=args.output)
+        print(json.dumps({"output": out_path, "status": "exported"}, indent=2, ensure_ascii=False))
     elif args.command == "serve":
         conn.close()
-        run_server(args.host, args.port, db_path, mode=runtime.mode)
+        try:
+            from .api import create_app
+            import uvicorn
+            app = create_app(db_path, mode=runtime.mode)
+            uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+        except Exception as e:
+            print(f"FastAPI startup failed: {e}")
+            print("Falling back to stdlib server (deprecated)...")
+            run_server(args.host, args.port, db_path, mode=runtime.mode)
+    elif args.command == "list-sources":
+        sources = list_all_sources()
+        # Enrich with actual sync status from the database
+        rows = conn.execute(
+            """
+            SELECT source, dataset, trading_date, status, rows_loaded
+            FROM data_sources
+            WHERE (source, dataset, trading_date) IN (
+                SELECT source, dataset, MAX(trading_date)
+                FROM data_sources
+                GROUP BY source, dataset
+            )
+            ORDER BY source, dataset
+            """
+        ).fetchall()
+        status_map: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            key = row["source"]
+            if key not in status_map:
+                status_map[key] = {"datasets": {}}
+            status_map[key]["datasets"][row["dataset"]] = {
+                "status": row["status"],
+                "trading_date": row["trading_date"],
+                "rows_loaded": row["rows_loaded"],
+            }
+        for src in sources:
+            src["sync_status"] = status_map.get(src["source"], {}).get("datasets", {})
+            meta = get_source_meta(src["source"])
+            if meta:
+                src["copyright_notice"] = meta.copyright_notice
+        print(json.dumps(sources, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

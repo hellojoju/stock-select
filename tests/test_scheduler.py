@@ -29,7 +29,7 @@ def test_scheduler_has_required_jobs():
     expected_ids = {
         "sync_data",
         "preopen_pick",
-        "open_simulation",
+        "simulate",
         "close_sync",
         "deterministic_review",
         "llm_review",
@@ -42,7 +42,7 @@ def test_weekday_jobs_have_day_of_week_constraint():
     """Weekday jobs should only run mon-fri."""
     scheduler = create_scheduler()
     weekday_job_ids = {
-        "sync_data", "preopen_pick", "open_simulation",
+        "sync_data", "preopen_pick", "simulate",
         "close_sync", "deterministic_review", "llm_review",
     }
 
@@ -79,12 +79,12 @@ def test_scheduler_job_timing():
     job_map = {job.id: job for job in scheduler.get_jobs()}
 
     cases = [
-        ("sync_data", "8", "0"),
-        ("preopen_pick", "8", "10"),
-        ("open_simulation", "9", "25"),
+        ("sync_data", "7", "0"),
+        ("preopen_pick", "7", "50"),
+        ("simulate", "9", "30"),
         ("close_sync", "15", "5"),
-        ("deterministic_review", "15", "15"),
-        ("llm_review", "15", "30"),
+        ("deterministic_review", "15", "30"),
+        ("llm_review", "15", "45"),
     ]
     for job_id, expected_hour, expected_minute in cases:
         job = job_map[job_id]

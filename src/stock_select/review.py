@@ -70,7 +70,7 @@ def generate_deterministic_reviews(conn: sqlite3.Connection, trading_date: str) 
     run_blindspot_review(conn, trading_date)
     run_gene_reviews_for_date(conn, trading_date)
     run_system_review(conn, trading_date)
-    run_analyst_reviews(conn, trading_date)
+    run_analyst_reviews(conn, trading_date, include_llm=False)
     return review_ids
 
 

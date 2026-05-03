@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
+import signal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+logger = logging.getLogger(__name__)
 
 from .agent_runtime import run_phase
 from .api import DB_PATH, run_data_sync
@@ -27,6 +31,7 @@ from .simulator import summarize_performance
 from .strategies import seed_default_genes
 from .system_review import review_summary
 from .stock_views import search_stocks
+from .health_check import startup_health_check
 
 
 def _load_market_context(conn, trading_date: str, result: dict) -> None:
@@ -39,8 +44,8 @@ def _load_market_context(conn, trading_date: str, result: dict) -> None:
         if overview:
             from .market_overview import MarketOverview
             result["market_overview"] = _to_dict(overview)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to load market context for %s: %s", trading_date, e)
 
     try:
         from .sentiment_cycle import get_sentiment_cycle, generate_sentiment_cycle
@@ -49,8 +54,8 @@ def _load_market_context(conn, trading_date: str, result: dict) -> None:
             cycle = generate_sentiment_cycle(conn, trading_date)
         if cycle:
             result["sentiment_cycle"] = _to_dict(cycle)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to load sentiment cycle for %s: %s", trading_date, e)
 
 
 def _load_sector_quant(conn, stock_code: str, trading_date: str, result: dict) -> None:
@@ -65,8 +70,8 @@ def _load_sector_quant(conn, stock_code: str, trading_date: str, result: dict) -
             sectors = analyze_all_sectors(conn, trading_date)
             if sectors:
                 result["sector_analysis"] = {"top_sectors": [dict(s.__dict__) if hasattr(s, '__dict__') else s for s in sectors[:5]]}
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to load sector analysis for %s: %s", trading_date, e)
 
     # Stock quant
     try:
@@ -74,8 +79,8 @@ def _load_sector_quant(conn, stock_code: str, trading_date: str, result: dict) -
         quant = build_stock_quant_report(conn, stock_code, trading_date)
         if quant:
                 result["stock_quant"] = _to_dict(quant)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to load stock quant for %s on %s: %s", stock_code, trading_date, e)
 
     # Psychology review
     try:
@@ -90,8 +95,8 @@ def _load_sector_quant(conn, stock_code: str, trading_date: str, result: dict) -
                     psych = generate_psychology_review(conn, review_id)
                 if psych:
                     result["psychology_review"] = _to_dict(psych)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to load psychology review for %s: %s", stock_code, e)
 
     # Next day plan
     try:
@@ -106,17 +111,16 @@ def _load_sector_quant(conn, stock_code: str, trading_date: str, result: dict) -
                     plan = generate_next_day_plan(conn, review_id)
                 if plan:
                     result["next_day_plan"] = _to_dict(plan)
-    except Exception:
-        pass
-
+    except Exception as e:
+        logger.warning("Failed to load next day plan for %s: %s", stock_code, e)
     # Capital flow
     try:
         from .capital_flow import build_capital_flow_report
         cf = build_capital_flow_report(conn, stock_code, trading_date)
         if cf:
             result["capital_flow"] = _to_dict(cf)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to load capital flow for %s on %s: %s", stock_code, trading_date, e)
 
     # Custom sector tags
     try:
@@ -128,8 +132,8 @@ def _load_sector_quant(conn, stock_code: str, trading_date: str, result: dict) -
             tags = get_custom_sector_tags(conn, stock_code, trading_date)
         if tags:
             result["custom_sector_tags"] = tags
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to load custom sectors for %s on %s: %s", stock_code, trading_date, e)
 
 
 def _to_dict(obj):
@@ -219,7 +223,26 @@ def _generate_stock_ai_summary(
 
 
 def run_server(host: str = "127.0.0.1", port: int = 18425, db_path: str | Path | None = None, mode: str = "demo") -> None:
+    """Start the stdlib HTTP server. Deprecated: use FastAPI via `create_app` instead."""
+    import warnings
+    warnings.warn(
+        "run_server is deprecated. Use FastAPI (create_app + uvicorn) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     runtime = resolve_runtime(mode, db_path)
+
+    # Initialize DB schema and seed defaults once at startup, not per-request.
+    init_conn = connect(runtime.db_path)
+    try:
+        init_db(init_conn)
+        seed_default_genes(init_conn)
+        health = startup_health_check(init_conn)
+        print(f"Health check: {health['genes_valid']}/{health['genes_checked']} genes valid")
+        if not health["overall_ok"]:
+            print(f"  WARNING: {health['genes_invalid']} invalid gene(s) marked inactive")
+    finally:
+        init_conn.close()
 
     class Handler(ApiHandler):
         database_path = runtime.db_path
@@ -227,6 +250,28 @@ def run_server(host: str = "127.0.0.1", port: int = 18425, db_path: str | Path |
 
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Serving stock-select API on http://{host}:{port}")
+
+    # Auto-start scheduler with the correct runtime DB
+    try:
+        from .scheduler import start_scheduler, _scheduler_instance
+        start_scheduler(runtime.db_path)
+        from .scheduler import _scheduler_instance as sched
+        if sched:
+            print(f"Scheduler auto-started with {len(sched.get_jobs())} jobs")
+    except Exception as e:
+        print(f"Scheduler auto-start failed: {e}")
+
+    def _shutdown(signum: int, _frame) -> None:
+        logger.info("Received signal %s, shutting down gracefully...", signum)
+        try:
+            from .scheduler import stop_scheduler
+            stop_scheduler()
+        except Exception as e:
+            logger.warning("Error stopping scheduler: %s", e)
+        server.shutdown()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
     server.serve_forever()
 
 
@@ -313,8 +358,44 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/api/reviews/steps/"):
                 session_id = parsed.path.split("/")[-1]
                 self.respond_json(self.review_steps(session_id))
+            elif parsed.path == "/api/availability":
+                self.respond_json(self.availability(params.get("date")))
             elif parsed.path == "/api/system/status":
                 self.respond_json(self.system_status(params.get("date")))
+            elif parsed.path == "/api/scheduler/status":
+                self.respond_json(self.scheduler_status())
+            elif parsed.path == "/api/monitor/health":
+                self.respond_json(self.monitor_health())
+            elif parsed.path == "/api/monitor/runs":
+                self.respond_json(self.monitor_runs(params))
+            elif parsed.path == "/api/monitor/errors":
+                self.respond_json(self.monitor_errors(params))
+            elif parsed.path == "/api/monitor/daily-report":
+                self.respond_json(self.monitor_daily_report(params))
+            elif parsed.path == "/api/monitor/phase-summary":
+                self.respond_json(self.monitor_phase_summary(params))
+            elif parsed.path == "/api/monitor/missing-dates":
+                self.respond_json(self.monitor_missing_dates(params))
+            # ── Announcement monitor ──
+            elif parsed.path == "/api/announcements/alerts":
+                self.respond_json(self.announcement_alerts(params))
+            elif parsed.path.startswith("/api/announcements/alerts/"):
+                parts = parsed.path.split("/")
+                if len(parts) == 5:
+                    # /api/announcements/alerts/<alert_id>
+                    self.respond_json(self.announcement_alert_detail(parts[4]))
+                else:
+                    self.respond_json({"error": "not found"}, status=404)
+            elif parsed.path == "/api/announcements/monitor-runs":
+                self.respond_json(self.announcement_monitor_runs(params))
+            elif parsed.path == "/api/announcements/sector-heat":
+                self.respond_json(self.announcement_sector_heat(params))
+            elif parsed.path == "/api/announcements/live-stats":
+                self.respond_json(self.announcement_live_stats(params))
+            elif parsed.path == "/api/announcements/scan/status":
+                self.respond_json(self.announcement_scan_status())
+            elif parsed.path == "/api/announcements/events":
+                self.respond_json(self.announcement_scan_events(params))
             elif parsed.path == "/health":
                 self.respond_json({"status": "ok"})
             else:
@@ -353,6 +434,23 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/api/reviews/preopen-strategies/") and parsed.path.endswith("/rerun"):
                 gene_id = parsed.path.split("/")[4]
                 self.respond_json(self.rerun_preopen_strategy_review(gene_id, params))
+            elif parsed.path == "/api/scheduler/start":
+                self.respond_json(self.scheduler_start())
+            elif parsed.path == "/api/scheduler/stop":
+                self.respond_json(self.scheduler_stop())
+            # ── Announcement monitor ──
+            elif parsed.path == "/api/announcements/scan/trigger":
+                self.respond_json(self.announcement_scan_trigger())
+            elif parsed.path == "/api/announcements/scan/pause":
+                self.respond_json(self.announcement_scan_pause())
+            elif parsed.path == "/api/announcements/scan/resume":
+                self.respond_json(self.announcement_scan_resume())
+            elif parsed.path.startswith("/api/announcements/alerts/") and parsed.path.endswith("/acknowledge"):
+                alert_id = parsed.path.split("/")[4]
+                self.respond_json(self.announcement_alert_acknowledge(alert_id))
+            elif parsed.path.startswith("/api/announcements/alerts/") and parsed.path.endswith("/dismiss"):
+                alert_id = parsed.path.split("/")[4]
+                self.respond_json(self.announcement_alert_dismiss(alert_id))
             else:
                 self.respond_json({"error": "not found"}, status=404)
         except Exception as exc:
@@ -360,8 +458,6 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def db(self):
         conn = connect(self.database_path)
-        init_db(conn)
-        seed_default_genes(conn)
         return conn
 
     def dashboard(self, date: str | None):
@@ -584,39 +680,96 @@ class ApiHandler(BaseHTTPRequestHandler):
             result = stock_review(conn, stock_code, params["date"], params.get("gene_id"))
             result["_session_id"] = session_id
 
+            decisions = result.get("decisions", [])
             if result.get("hypothetical"):
-                log_step(session_id, "触发假设性复盘",
-                         "无策略决策记录，启动多维度实时分析",
-                         response_data={"stock_code": stock_code, "hypothetical": True})
-                conn.execute(
-                    "INSERT OR IGNORE INTO hypothetical_review_log (stock_code, trading_date) VALUES (?, ?)",
-                    (stock_code, params["date"]),
-                )
-                conn.commit()
-            else:
+                if result.get("data_insufficient"):
+                    log_step(session_id, "触发假设性复盘",
+                             "无策略决策记录，但数据不足无法完成分析",
+                             response_data={"stock_code": stock_code, "hypothetical": True, "reason": result.get("data_insufficient_reason", "数据不足")})
+                else:
+                    log_step(session_id, "触发假设性复盘",
+                             "无策略决策记录，启动多维度实时分析",
+                             response_data={"stock_code": stock_code, "hypothetical": True})
+                    conn.execute(
+                        "INSERT OR IGNORE INTO hypothetical_review_log (stock_code, trading_date) VALUES (?, ?)",
+                        (stock_code, params["date"]),
+                    )
+                    conn.commit()
+            elif decisions:
                 log_step(session_id, "找到策略决策记录",
-                         f"从数据库加载复盘数据",
-                         response_data={"stock_code": stock_code, "hypothetical": False, "decisions_count": len(result.get("decisions", []))})
+                         f"从数据库加载 {len(decisions)} 条决策",
+                         response_data={"stock_code": stock_code, "hypothetical": False, "decisions_count": len(decisions)})
+            else:
+                log_step(session_id, "未找到复盘数据",
+                         f"数据库中无 {stock_code} 在 {params.get('date', '')} 的复盘记录，且假设性复盘数据不足",
+                         completed=True,
+                         response_data={"stock_code": stock_code, "decisions_count": 0, "hypothetical": False, "reason": result.get("data_insufficient_reason", "无数据")})
 
             log_step(session_id, "加载市场环境与情绪周期",
                      "查询市场概览、涨跌家数、情绪周期阶段",
                      request_data={"trading_date": params.get("date", "")})
             _load_market_context(conn, params.get("date", ""), result)
-            market_ok = result.get("market_overview") is not None
-            sentiment_ok = result.get("sentiment_cycle") is not None
+            market_data = result.get("market_overview")
+            sentiment_data = result.get("sentiment_cycle")
+            market_resp = {}
+            if market_data:
+                market_resp = {k: market_data[k] for k in market_data if k in (
+                    "index_code", "index_name", "close_pct", "up_count", "down_count",
+                    "flat_count", "limit_up_count", "limit_down_count", "total_amount",
+                    "market_summary")}
+            sentiment_resp = {}
+            if sentiment_data:
+                sentiment_resp = {k: sentiment_data[k] for k in sentiment_data if k in (
+                    "phase", "phase_name", "up_limit_ratio", "down_limit_ratio",
+                    "consecutive_up_days", "consecutive_down_days", "yesterday_limit_up_premium",
+                    "summary")}
             log_step(session_id, "市场环境加载完成",
-                     f"市场概览: {'有' if market_ok else '无'}, 情绪周期: {'有' if sentiment_ok else '无'}",
+                     f"市场概览: {'有' if market_resp else '无'}, 情绪周期: {'有' if sentiment_resp else '无'}",
                      completed=True,
-                     response_data={"market_overview": market_ok, "sentiment_cycle": sentiment_ok})
+                     response_data={**market_resp, **sentiment_resp} if (market_resp or sentiment_resp) else {"status": "无数据"})
             log_step(session_id, "加载行业分析与量化因子",
                      "查询行业板块、连板形态、均线量价、资金流向",
                      request_data={"stock_code": stock_code})
             _load_sector_quant(conn, stock_code, params.get("date", ""), result)
-            sq = {k: result.get(k) is not None for k in ["sector_analysis", "stock_quant", "capital_flow", "custom_sector_tags"]}
+            sector_resp = {}
+            sector_data = result.get("sector_analysis")
+            if sector_data:
+                top = sector_data.get("top_sectors", [])[:3]
+                sector_resp["top_sectors"] = [
+                    {k: s.get(k) for k in ("sector_name", "sector_code", "return_pct", "limit_up_count", "team_complete")}
+                    for s in top
+                ]
+            stock_quant_data = result.get("stock_quant")
+            if stock_quant_data:
+                stock_quant_resp = {
+                    "moving_average": stock_quant_data.get("moving_average"),
+                    "volume_analysis": stock_quant_data.get("volume_analysis"),
+                    "limit_up_chain": stock_quant_data.get("limit_up_chain"),
+                }
+            else:
+                stock_quant_resp = {"status": "无数据"}
+            capital_data = result.get("capital_flow")
+            capital_resp = {}
+            if capital_data:
+                capital_resp = {k: capital_data[k] for k in capital_data if k in (
+                    "main_net_inflow", "super_large_net", "large_net", "medium_net",
+                    "small_net", "flow_direction", "summary")}
+            psychology_data = result.get("psychology_review")
+            psychology_resp = {}
+            if psychology_data:
+                psychology_resp = {k: psychology_data[k] for k in psychology_data if k in (
+                    "verdict", "scenario", "plan", "summary")}
             log_step(session_id, "行业量化加载完成",
-                     ", ".join(f"{k}: {'有' if v else '无'}" for k, v in sq.items()),
+                     ", ".join(f"{k}: {'有' if v and v.get('status') != '无数据' else '无'}"
+                               for k, v in [("sector", sector_resp), ("quant", stock_quant_resp),
+                                            ("capital", capital_resp), ("psychology", psychology_resp)]),
                      completed=True,
-                     response_data=sq)
+                     response_data={
+                         "sector_analysis": sector_resp,
+                         "stock_quant": stock_quant_resp,
+                         "capital_flow": capital_resp,
+                         "psychology_review": psychology_resp,
+                     })
 
             # AI summary
             log_step(session_id, "生成 AI 解读", "调用 LLM API 生成自然语言总结", completed=False)
@@ -961,11 +1114,293 @@ class ApiHandler(BaseHTTPRequestHandler):
         from .step_logger import get_session_steps
         return {"steps": get_session_steps(session_id)}
 
+    def availability(self, date: str | None) -> dict:
+        from .data_availability import check_data_availability
+        conn = self.db()
+        try:
+            current_date = date or latest_trading_date(conn)
+            avail = check_data_availability(conn, current_date)
+            return {
+                "date": current_date,
+                "status": avail.status,
+                "price_coverage_pct": avail.price_coverage_pct,
+                "pick_count": avail.pick_count,
+                "event_source_count": avail.event_source_count,
+                "review_evidence_count": avail.review_evidence_count,
+                "reasons": avail.reasons,
+            }
+        finally:
+            conn.close()
+
     def system_status(self, date: str | None) -> dict:
         conn = self.db()
         try:
             current_date = date or latest_trading_date(conn)
             return self.runtime_context.as_payload() | {"date": current_date}
+        finally:
+            conn.close()
+
+    def scheduler_status(self) -> dict:
+        from .scheduler import get_scheduler_status
+        return get_scheduler_status()
+
+    def scheduler_start(self) -> dict:
+        from .scheduler import start_scheduler
+        try:
+            start_scheduler(self.database_path)
+            return {"status": "ok", "message": "Scheduler started"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def scheduler_stop(self) -> dict:
+        from .scheduler import stop_scheduler
+        stop_scheduler()
+        return {"status": "ok", "message": "Scheduler stopped"}
+
+    def monitor_health(self) -> dict:
+        from .data_health import generate_health_report
+        conn = self.db()
+        try:
+            report = generate_health_report(conn)
+            return {
+                "generated_at": report.generated_at,
+                "sources": [
+                    {"source": s.source, "status": s.status, "last_sync": s.last_sync, "staleness_hours": s.staleness_hours}
+                    for s in report.sources
+                ],
+                "latest_trading_date": report.latest_trading_date,
+                "stale_sources": report.stale_sources,
+                "error_count": report.error_count,
+            }
+        finally:
+            conn.close()
+
+    def monitor_runs(self, params: dict[str, str]) -> list[dict]:
+        from .task_monitor import get_recent_runs
+        conn = self.db()
+        try:
+            limit = int(params.get("limit", "50"))
+            status_filter = params.get("status")
+            phase_filter = params.get("phase")
+            runs = get_recent_runs(conn, status=status_filter, phase=phase_filter, limit=limit)
+            return [
+                {"run_id": r.run_id, "phase": r.phase, "trading_date": r.trading_date, "status": r.status,
+                 "error": r.error, "started_at": r.started_at, "finished_at": r.finished_at}
+                for r in runs
+            ]
+        finally:
+            conn.close()
+
+    def monitor_errors(self, params: dict[str, str]) -> list[dict]:
+        from .task_monitor import get_error_summary
+        conn = self.db()
+        try:
+            limit = int(params.get("limit", "20"))
+            return get_error_summary(conn, limit=limit)
+        finally:
+            conn.close()
+
+    def monitor_daily_report(self, params: dict[str, str]) -> dict:
+        from .task_monitor import get_daily_report
+        conn = self.db()
+        try:
+            date = params.get("date", "")
+            if not date:
+                return {"error": "date required"}
+            report = get_daily_report(conn, date)
+            return {
+                "trading_date": report.trading_date,
+                "phases_run": report.phases_run,
+                "phases_missing": report.phases_missing,
+                "all_ok": report.all_ok,
+                "errors": report.errors,
+            }
+        finally:
+            conn.close()
+
+    def monitor_phase_summary(self, params: dict[str, str]) -> dict:
+        from .task_monitor import get_phase_summary
+        conn = self.db()
+        try:
+            phase = params.get("phase", "")
+            if not phase:
+                return {"error": "phase required"}
+            summary = get_phase_summary(conn, phase)
+            return {
+                "phase": summary.phase,
+                "total_runs": summary.total_runs,
+                "ok_runs": summary.ok_runs,
+                "error_runs": summary.error_runs,
+                "last_run_date": summary.last_run_date,
+                "last_run_status": summary.last_run_status,
+            }
+        finally:
+            conn.close()
+
+    def monitor_missing_dates(self, params: dict[str, str]) -> list[str]:
+        from .data_health import get_missing_dates
+        conn = self.db()
+        try:
+            days = int(params.get("days", "5"))
+            return get_missing_dates(conn, lookback_days=days)
+        finally:
+            conn.close()
+
+    # ── Announcement monitor ──
+
+    def announcement_alerts(self, params: dict[str, str]) -> list[dict]:
+        conn = self.db()
+        try:
+            query = "SELECT * FROM announcement_alerts WHERE 1=1"
+            args: list = []
+            if params.get("date"):
+                query += " AND trading_date=?"
+                args.append(params["date"])
+            if params.get("status"):
+                query += " AND status=?"
+                args.append(params["status"])
+            if params.get("alert_type"):
+                query += " AND alert_type=?"
+                args.append(params["alert_type"])
+            if params.get("stock_code"):
+                query += " AND stock_code=?"
+                args.append(params["stock_code"])
+            query += " ORDER BY discovered_at DESC LIMIT ?"
+            args.append(int(params.get("limit", "50")))
+            return rows_to_dicts(conn.execute(query, args))
+        finally:
+            conn.close()
+
+    def announcement_alert_detail(self, alert_id: str) -> dict | None:
+        conn = self.db()
+        try:
+            row = conn.execute(
+                "SELECT * FROM announcement_alerts WHERE alert_id=?",
+                (alert_id,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def announcement_alert_acknowledge(self, alert_id: str) -> dict:
+        conn = self.db()
+        try:
+            conn.execute(
+                "UPDATE announcement_alerts SET status='acknowledged' WHERE alert_id=?",
+                (alert_id,),
+            )
+            conn.commit()
+            return {"status": "ok", "alert_id": alert_id}
+        finally:
+            conn.close()
+
+    def announcement_alert_dismiss(self, alert_id: str) -> dict:
+        conn = self.db()
+        try:
+            conn.execute(
+                "UPDATE announcement_alerts SET status='dismissed' WHERE alert_id=?",
+                (alert_id,),
+            )
+            conn.commit()
+            return {"status": "ok", "alert_id": alert_id}
+        finally:
+            conn.close()
+
+    def announcement_monitor_runs(self, params: dict[str, str]) -> list[dict]:
+        conn = self.db()
+        try:
+            return rows_to_dicts(
+                conn.execute(
+                    "SELECT * FROM monitor_runs ORDER BY started_at DESC LIMIT ?",
+                    (int(params.get("limit", "20")),),
+                )
+            )
+        finally:
+            conn.close()
+
+    def announcement_sector_heat(self, params: dict[str, str]) -> list[dict]:
+        conn = self.db()
+        try:
+            d = params.get("date") or latest_trading_date(conn)
+            if not d:
+                return []
+            return rows_to_dicts(
+                conn.execute(
+                    "SELECT * FROM sector_heat_index WHERE trading_date=? ORDER BY heat_score DESC",
+                    (d,),
+                )
+            )
+        finally:
+            conn.close()
+
+    def announcement_live_stats(self, params: dict[str, str]) -> dict:
+        conn = self.db()
+        try:
+            d = params.get("date") or latest_trading_date(conn)
+            if not d:
+                return {"date": None, "total": 0, "by_type": {}, "max_score": 0, "new_count": 0}
+            total = conn.execute(
+                "SELECT COUNT(*) FROM announcement_alerts WHERE trading_date=?", (d,)
+            ).fetchone()[0]
+            by_type = {}
+            for row in conn.execute(
+                "SELECT alert_type, COUNT(*) as cnt FROM announcement_alerts WHERE trading_date=? GROUP BY alert_type",
+                (d,),
+            ):
+                by_type[row["alert_type"]] = row["cnt"]
+            max_score_row = conn.execute(
+                "SELECT MAX(sentiment_score) as mx FROM announcement_alerts WHERE trading_date=?", (d,)
+            ).fetchone()
+            max_score = max_score_row["mx"] or 0
+            new_count = conn.execute(
+                "SELECT COUNT(*) FROM announcement_alerts WHERE trading_date=? AND status='new'", (d,)
+            ).fetchone()[0]
+            return {
+                "date": d,
+                "total": total,
+                "by_type": by_type,
+                "max_score": round(max_score, 3),
+                "new_count": new_count,
+            }
+        finally:
+            conn.close()
+
+    def announcement_scan_trigger(self) -> dict:
+        from .announcement_monitor import run_announcement_scan
+        conn = self.db()
+        try:
+            init_db(conn)
+            alerts = run_announcement_scan(conn)
+            return {"success": True, "alerts_found": len(alerts)}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+        finally:
+            conn.close()
+
+    def announcement_scan_pause(self) -> dict:
+        from .scheduler import pause_announcement_scan
+        ok = pause_announcement_scan()
+        return {"success": ok, "message": "自动扫描已暂停" if ok else "调度器未运行"}
+
+    def announcement_scan_resume(self) -> dict:
+        from .scheduler import resume_announcement_scan
+        ok = resume_announcement_scan()
+        return {"success": ok, "message": "自动扫描已恢复" if ok else "调度器未运行"}
+
+    def announcement_scan_status(self) -> dict:
+        from .scheduler import is_scan_paused, get_scheduler_status
+        sched = get_scheduler_status()
+        auto_paused = is_scan_paused() if sched["running"] else None
+        return {
+            "scheduler_running": sched["running"],
+            "auto_paused": auto_paused,
+        }
+
+    def announcement_scan_events(self, params: dict[str, str]) -> list[dict]:
+        from .announcement_monitor import get_scan_events
+        conn = self.db()
+        try:
+            return get_scan_events(int(params.get("limit", "50")), conn=conn)
         finally:
             conn.close()
 
@@ -985,7 +1420,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def send_cors_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = self.headers.get("Origin", "")
+        allowed = {"http://127.0.0.1:19283", "http://localhost:19283", "http://127.0.0.1:5173", "http://localhost:5173"}
+        if origin and origin in allowed:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+        else:
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 

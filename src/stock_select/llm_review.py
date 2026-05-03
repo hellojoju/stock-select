@@ -254,33 +254,49 @@ def _call_llm_with_config(
     decision_review_id: str | None = None,
     packet: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Call the LLM using provider-abstracted client, record timing, write scratchpad."""
+    """Call the LLM using provider-abstracted client, record timing, write scratchpad.
+
+    S6.4: LLM failure degrades gracefully — returns None without affecting
+    deterministic review. Retries once on transient errors.
+    """
     client_fn = get_llm_client(config)
     if client_fn is None:
         return None
 
-    budget_before = (get_budget().tokens_prompt, get_budget().tokens_completion, get_budget().total_cost)
-    start = time.monotonic()
-    try:
-        result = client_fn(prompt, system)
-    except Exception as exc:
-        logger.error("LLM call failed: %s", exc)
-        latency_ms = int((time.monotonic() - start) * 1000)
-        _write_scratchpad(conn, llm_review_id, decision_review_id, packet, config, 0, 0, 0.0, latency_ms, "error", str(exc))
-        return None
+    # S6.4: Retry on transient failure
+    last_error = None
+    for attempt in range(2):
+        budget_before = (get_budget().tokens_prompt, get_budget().tokens_completion, get_budget().total_cost)
+        start = time.monotonic()
+        try:
+            result = client_fn(prompt, system)
+            latency_ms = int((time.monotonic() - start) * 1000)
+            budget_after = (get_budget().tokens_prompt, get_budget().tokens_completion, get_budget().total_cost)
+            prompt_tokens = budget_after[0] - budget_before[0]
+            completion_tokens = budget_after[1] - budget_before[1]
+            cost = budget_after[2] - budget_before[2]
 
-    latency_ms = int((time.monotonic() - start) * 1000)
-    budget_after = (get_budget().tokens_prompt, get_budget().tokens_completion, get_budget().total_cost)
-    prompt_tokens = budget_after[0] - budget_before[0]
-    completion_tokens = budget_after[1] - budget_before[1]
-    cost = budget_after[2] - budget_before[2]
+            if result is None:
+                _write_scratchpad(conn, llm_review_id, decision_review_id, packet, config, prompt_tokens, completion_tokens, cost, latency_ms, "error", "LLM returned None or invalid JSON")
+                return None
 
-    if result is None:
-        _write_scratchpad(conn, llm_review_id, decision_review_id, packet, config, prompt_tokens, completion_tokens, cost, latency_ms, "error", "LLM returned None or invalid JSON")
-        return None
+            _write_scratchpad(conn, llm_review_id, decision_review_id, packet, config, prompt_tokens, completion_tokens, cost, latency_ms, "ok")
+            return result
+        except Exception as exc:
+            last_error = exc
+            latency_ms = int((time.monotonic() - start) * 1000)
+            logger.warning("LLM call failed (attempt %d): %s", attempt + 1, exc)
+            if attempt == 0:
+                time.sleep(1)  # Brief pause before retry
+            continue
 
-    _write_scratchpad(conn, llm_review_id, decision_review_id, packet, config, prompt_tokens, completion_tokens, cost, latency_ms, "ok")
-    return result
+    # S6.4: All retries exhausted — degrade gracefully
+    logger.error("LLM call failed after retries: %s", last_error)
+    _write_scratchpad(
+        conn, llm_review_id, decision_review_id, packet, config,
+        0, 0, 0.0, latency_ms, "error", f"Retry failed: {last_error}",
+    )
+    return None
 
 
 def get_llm_client(config: LLMConfig):
@@ -454,8 +470,11 @@ def _persist_llm_review(
         ON CONFLICT(decision_review_id) DO UPDATE SET
           attribution_json = excluded.attribution_json,
           reason_check_json = excluded.reason_check_json,
+          suggested_errors_json = excluded.suggested_errors_json,
+          suggested_signals_json = excluded.suggested_signals_json,
           summary = excluded.summary,
-          status = excluded.status
+          status = excluded.status,
+          created_at = CURRENT_TIMESTAMP
         """,
         (
             llm_review_id,

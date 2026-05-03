@@ -60,6 +60,7 @@ def upsert_daily_price(
     high: float,
     low: float,
     close: float,
+    prev_close: float | None = None,
     volume: float = 0,
     amount: float = 0,
     is_suspended: bool = False,
@@ -70,15 +71,16 @@ def upsert_daily_price(
     conn.execute(
         """
         INSERT INTO daily_prices(
-          stock_code, trading_date, open, high, low, close, volume, amount,
+          stock_code, trading_date, open, high, low, close, prev_close, volume, amount,
           is_suspended, is_limit_up, is_limit_down, source
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(stock_code, trading_date) DO UPDATE SET
           open = excluded.open,
           high = excluded.high,
           low = excluded.low,
           close = excluded.close,
+          prev_close = excluded.prev_close,
           volume = excluded.volume,
           amount = excluded.amount,
           is_suspended = excluded.is_suspended,
@@ -93,6 +95,7 @@ def upsert_daily_price(
             high,
             low,
             close,
+            prev_close,
             volume,
             amount,
             int(is_suspended),
@@ -862,8 +865,7 @@ def upsert_analyst_expectation(
           source, source_url, source_fetched_at, confidence, raw_json
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(stock_code, report_date, forecast_period, org_name, author_name)
-        DO UPDATE SET
+        ON CONFLICT(expectation_id) DO UPDATE SET
           expectation_id = excluded.expectation_id,
           report_title = excluded.report_title,
           forecast_revenue = excluded.forecast_revenue,

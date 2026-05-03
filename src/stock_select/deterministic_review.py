@@ -44,10 +44,19 @@ def review_decision(conn: sqlite3.Connection, decision_id: str) -> str:
     row = load_decision_row(conn, decision_id)
     review_id = build_review_id(decision_id)
     packet = repository.loads(row["packet_json"], {}) if row["packet_json"] else {}
+
+    # Rejected decisions have no outcome - record as "rejected"
+    if row["entry_price"] is None:
+        _record_rejected_review(conn, review_id, row)
+        return review_id
+
     outcome = {
         "entry_price": float(row["entry_price"]),
         "close_price": float(row["close_price"]),
         "return_pct": float(row["return_pct"]),
+        "benchmark_return": float(row["benchmark_return"] or 0) if row["benchmark_return"] is not None else 0.0,
+        "sector_return": float(row["sector_return"] or 0) if row["sector_return"] is not None else 0.0,
+        "alpha": float(row["alpha"]) if row["alpha"] is not None else float(row["return_pct"]),
         "relative_return_pct": float(row["return_pct"]) - float(row["index_return_pct"] or 0),
         "max_drawdown_intraday_pct": float(row["max_drawdown_intraday_pct"]),
         "hit_sell_rule": row["hit_sell_rule"],
@@ -55,11 +64,11 @@ def review_decision(conn: sqlite3.Connection, decision_id: str) -> str:
     evidence_ids = upsert_decision_evidence(conn, review_id, row, packet)
     evidence_by_source = evidence_ids_by_source(conn, review_id)
     factor_items = build_factor_items(conn, row, packet, evidence_ids, evidence_by_source)
-    verdict = overall_verdict(outcome["return_pct"], factor_items)
+    verdict = overall_verdict(outcome["alpha"], factor_items)
     primary_driver = choose_primary_driver(factor_items, packet)
     summary = (
         f"{row['trading_date']} {row['strategy_gene_id']} {row['stock_code']} "
-        f"{verdict.lower()}; return {outcome['return_pct']:.2%}, driver {primary_driver}."
+        f"{verdict.lower()}; return {outcome['return_pct']:.2%}, alpha {outcome['alpha']:.2%}, driver {primary_driver}."
     )
     deterministic = {
         "decision_id": decision_id,
@@ -147,12 +156,13 @@ def load_decision_row(conn: sqlite3.Connection, decision_id: str) -> sqlite3.Row
         """
         SELECT p.*, s.name AS stock_name, s.industry, o.entry_price, o.close_price,
                o.return_pct, o.max_drawdown_intraday_pct, o.hit_sell_rule,
+               o.benchmark_return, o.sector_return, o.alpha,
                t.index_return_pct, c.packet_json, c.technical_score,
                c.fundamental_score, c.event_score, c.sector_score, c.risk_penalty,
                d.open, d.high, d.low, d.close, d.is_suspended, d.is_limit_up
         FROM pick_decisions p
         JOIN stocks s ON s.stock_code = p.stock_code
-        JOIN outcomes o ON o.decision_id = p.decision_id
+        LEFT JOIN outcomes o ON o.decision_id = p.decision_id
         LEFT JOIN trading_days t ON t.trading_date = p.trading_date
         LEFT JOIN candidate_scores c
           ON c.trading_date = p.trading_date
@@ -270,7 +280,10 @@ def build_factor_items(
     evidence_ids: list[str],
     evidence_by_source: dict[str, list[str]],
 ) -> list[dict[str, Any]]:
+    # Use alpha (stock selection skill) for attribution when available,
+    # otherwise fall back to raw return_pct
     return_pct = float(row["return_pct"])
+    alpha = float(row["alpha"]) if row["alpha"] is not None else return_pct
     drawdown = float(row["max_drawdown_intraday_pct"])
     stock_code = row["stock_code"]
     trading_date = row["trading_date"]
@@ -282,12 +295,12 @@ def build_factor_items(
     financial_actual = repository.latest_financial_actuals_before(conn, stock_code, trading_date)
     base_evidence = ids_for_sources(evidence_by_source, ["candidate_score", "daily_price", "outcome"], fallback=evidence_ids)
     items = [
-        technical_check(row, packet, return_pct, base_evidence),
-        fundamental_check(row, packet, return_pct, drawdown, ids_for_sources(evidence_by_source, ["financial_actual", "candidate_score"], fallback=evidence_ids)),
-        event_check(row, packet, return_pct, ids_for_sources(evidence_by_source, ["order_contract", "candidate_score"], fallback=evidence_ids)),
-        sector_check(row, packet, return_pct, base_evidence),
-        risk_check(row, packet, return_pct, drawdown, ids_for_sources(evidence_by_source, ["risk_event", "candidate_score"], fallback=evidence_ids)),
-        execution_check(row, return_pct, base_evidence),
+        technical_check(row, packet, alpha, base_evidence),
+        fundamental_check(row, packet, alpha, drawdown, ids_for_sources(evidence_by_source, ["financial_actual", "candidate_score"], fallback=evidence_ids)),
+        event_check(row, packet, alpha, ids_for_sources(evidence_by_source, ["order_contract", "candidate_score"], fallback=evidence_ids)),
+        sector_check(row, packet, alpha, base_evidence),
+        risk_check(row, packet, alpha, drawdown, ids_for_sources(evidence_by_source, ["risk_event", "candidate_score"], fallback=evidence_ids)),
+        execution_check(row, alpha, base_evidence),
         earnings_surprise_check(row, surprises, ids_for_sources(evidence_by_source, ["earnings_surprise", "analyst_expectation", "financial_actual"], fallback=evidence_ids)),
         order_contract_check(row, orders, ids_for_sources(evidence_by_source, ["order_contract"], fallback=evidence_ids)),
         business_kpi_check(row, kpis, ids_for_sources(evidence_by_source, ["business_kpi"], fallback=evidence_ids)),
@@ -679,3 +692,41 @@ def build_item_id(review_id: str, factor_type: str) -> str:
 
 def build_evidence_id(review_id: str, source_type: str, source_id: str) -> str:
     return "ev_" + hashlib.sha1(f"{review_id}:{source_type}:{source_id}".encode("utf-8")).hexdigest()[:14]
+
+
+def _record_rejected_review(
+    conn: sqlite3.Connection,
+    review_id: str,
+    row: sqlite3.Row,
+) -> None:
+    """Create a review entry for rejected (non-executed) decisions."""
+    summary = (
+        f"{row['trading_date']} {row['strategy_gene_id']} {row['stock_code']} "
+        f"rejected; order not executed."
+    )
+    conn.execute(
+        """
+        INSERT INTO decision_reviews(
+          review_id, decision_id, trading_date, strategy_gene_id, stock_code,
+          verdict, primary_driver, return_pct, relative_return_pct,
+          max_drawdown_intraday_pct, thesis_quality_score, evidence_quality_score,
+          deterministic_json, llm_json, summary
+        )
+        VALUES (?, ?, ?, ?, ?, 'rejected', 'order_rejected', 0, 0, 0, 0, 0, ?, NULL, ?)
+        ON CONFLICT(decision_id) DO UPDATE SET
+          verdict = excluded.verdict,
+          primary_driver = excluded.primary_driver,
+          return_pct = excluded.return_pct,
+          summary = excluded.summary,
+          updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            review_id,
+            row["decision_id"],
+            row["trading_date"],
+            row["strategy_gene_id"],
+            row["stock_code"],
+            json.dumps({"rejected": True, "decision_id": row["decision_id"]}),
+            summary,
+        ),
+    )

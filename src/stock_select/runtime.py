@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .db import _PROJECT_ROOT
 
 VALID_RUNTIME_MODES = {"demo", "live"}
-DEMO_DB_PATH = Path("var/stock_select_demo.db")
-LIVE_DB_PATH = Path("var/stock_select_live.db")
-LEGACY_DB_PATH = Path("var/stock_select.db")
+LEGACY_DB_PATH = _PROJECT_ROOT / "var" / "stock_select.db"
+# demo 模式使用主数据库（与 legacy 相同），方便开发调试
+DEMO_DB_PATH = LEGACY_DB_PATH
+LIVE_DB_PATH = _PROJECT_ROOT / "var" / "stock_select_live.db"
 
 
 @dataclass(frozen=True)

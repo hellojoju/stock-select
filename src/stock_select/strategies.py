@@ -18,6 +18,8 @@ DEFAULT_GENES: list[dict[str, Any]] = [
         "name": "Aggressive momentum",
         "horizon": "short",
         "risk_profile": "aggressive",
+        "strategy_type": "momentum_breakout",
+        "market_environments": ["all"],
         "params": {
             "lookback_days": 5,
             "max_picks": 3,
@@ -44,6 +46,8 @@ DEFAULT_GENES: list[dict[str, Any]] = [
         "name": "Conservative quality trend",
         "horizon": "long",
         "risk_profile": "conservative",
+        "strategy_type": "quality_value",
+        "market_environments": ["all"],
         "params": {
             "lookback_days": 8,
             "max_picks": 3,
@@ -70,6 +74,8 @@ DEFAULT_GENES: list[dict[str, Any]] = [
         "name": "Balanced multi-factor",
         "horizon": "short",
         "risk_profile": "balanced",
+        "strategy_type": "balanced",
+        "market_environments": ["all"],
         "params": {
             "lookback_days": 6,
             "max_picks": 4,
@@ -93,6 +99,94 @@ DEFAULT_GENES: list[dict[str, Any]] = [
     },
 ]
 
+# Challenger genes: new strategy types, introduced for competition
+CHALLENGER_GENES: list[dict[str, Any]] = [
+    {
+        "gene_id": "gene_mean_reversion_v1",
+        "name": "Mean reversion",
+        "horizon": "short",
+        "risk_profile": "aggressive",
+        "strategy_type": "mean_reversion",
+        "market_environments": ["all"],
+        "params": {
+            "lookback_days": 10,
+            "max_picks": 3,
+            "momentum_weight": -0.3,
+            "volume_weight": 0.15,
+            "volatility_weight": 0.1,
+            "volatility_penalty": 0.05,
+            "position_pct": 0.08,
+            "min_score": 0.005,
+            "take_profit_pct": 0.05,
+            "stop_loss_pct": -0.04,
+            "time_exit_days": 2,
+            "technical_component_weight": 0.55,
+            "fundamental_component_weight": 0.1,
+            "event_component_weight": 0.15,
+            "sector_component_weight": 0.1,
+            "risk_component_weight": 0.3,
+            "max_per_industry": 2,
+            "min_avg_amount": 0,
+        },
+    },
+    {
+        "gene_id": "gene_event_driven_v1",
+        "name": "Event driven",
+        "horizon": "short",
+        "risk_profile": "aggressive",
+        "strategy_type": "event_driven",
+        "market_environments": ["all"],
+        "params": {
+            "lookback_days": 5,
+            "max_picks": 4,
+            "momentum_weight": 0.3,
+            "volume_weight": 0.2,
+            "volatility_weight": 0.05,
+            "volatility_penalty": 0.1,
+            "position_pct": 0.07,
+            "min_score": 0.005,
+            "take_profit_pct": 0.08,
+            "stop_loss_pct": -0.03,
+            "time_exit_days": 1,
+            "technical_component_weight": 0.2,
+            "fundamental_component_weight": 0.1,
+            "event_component_weight": 0.45,
+            "sector_component_weight": 0.15,
+            "risk_component_weight": 0.25,
+            "max_per_industry": 3,
+            "min_avg_amount": 0,
+        },
+    },
+    {
+        "gene_id": "gene_defensive_v1",
+        "name": "Defensive low-vol",
+        "horizon": "long",
+        "risk_profile": "conservative",
+        "strategy_type": "defensive",
+        "market_environments": ["all"],
+        "params": {
+            "lookback_days": 12,
+            "max_picks": 2,
+            "momentum_weight": 0.2,
+            "volume_weight": 0.1,
+            "volatility_weight": 0.0,
+            "volatility_penalty": 0.6,
+            "position_pct": 0.06,
+            "min_score": 0.003,
+            "take_profit_pct": 0.12,
+            "stop_loss_pct": -0.06,
+            "time_exit_days": 5,
+            "technical_component_weight": 0.18,
+            "fundamental_component_weight": 0.35,
+            "event_component_weight": 0.05,
+            "sector_component_weight": 0.12,
+            "risk_component_weight": 0.5,
+            "max_per_industry": 1,
+            "min_avg_amount": 50000000,
+        },
+    },
+]
+
 
 @dataclass(frozen=True)
 class StockScore:
@@ -104,18 +198,21 @@ class StockScore:
 
 
 def seed_default_genes(conn: sqlite3.Connection) -> None:
-    for gene in DEFAULT_GENES:
+    for gene in DEFAULT_GENES + CHALLENGER_GENES:
         conn.execute(
             """
             INSERT INTO strategy_genes(
-              gene_id, name, version, horizon, risk_profile, params_json
+              gene_id, name, version, horizon, risk_profile, status,
+              strategy_type, market_environments_json, params_json
             )
-            VALUES (?, ?, 1, ?, ?, ?)
+            VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(gene_id) DO UPDATE SET
               name = excluded.name,
               horizon = excluded.horizon,
               risk_profile = excluded.risk_profile,
               params_json = excluded.params_json,
+              strategy_type = excluded.strategy_type,
+              market_environments_json = excluded.market_environments_json,
               updated_at = CURRENT_TIMESTAMP
             """,
             (
@@ -123,6 +220,9 @@ def seed_default_genes(conn: sqlite3.Connection) -> None:
                 gene["name"],
                 gene["horizon"],
                 gene["risk_profile"],
+                "active" if gene in DEFAULT_GENES else "observing",
+                gene.get("strategy_type", "generic"),
+                json.dumps(gene.get("market_environments", ["all"])),
                 repository.dumps(gene["params"]),
             ),
         )
@@ -133,10 +233,16 @@ def generate_picks_for_gene(
     conn: sqlite3.Connection,
     trading_date: str,
     gene_id: str,
+    *,
+    preserve_audit: bool = False,
 ) -> list[str]:
     gene = repository.get_gene(conn, gene_id)
     params = json.loads(gene["params_json"])
-    clear_existing_gene_decisions(conn, trading_date, gene_id)
+    required = {"max_picks", "min_score", "position_pct", "take_profit_pct", "stop_loss_pct", "time_exit_days"}
+    missing = required - set(params.keys())
+    if missing:
+        raise ValueError(f"gene {gene_id} params missing required keys: {missing}")
+    clear_existing_gene_decisions(conn, trading_date, gene_id, preserve_audit=preserve_audit)
     candidates = rank_candidates_for_gene(conn, trading_date, gene_id, params)
     max_picks = int(params["max_picks"])
     min_score = float(params["min_score"])
@@ -212,7 +318,13 @@ def generate_picks_for_gene(
     return decision_ids
 
 
-def clear_existing_gene_decisions(conn: sqlite3.Connection, trading_date: str, gene_id: str) -> None:
+def clear_existing_gene_decisions(
+    conn: sqlite3.Connection,
+    trading_date: str,
+    gene_id: str,
+    *,
+    preserve_audit: bool = False,
+) -> None:
     rows = conn.execute(
         """
         SELECT decision_id FROM pick_decisions
@@ -229,6 +341,8 @@ def clear_existing_gene_decisions(conn: sqlite3.Connection, trading_date: str, g
         decision_ids,
     ).fetchall()
     review_ids = [row["review_id"] for row in review_rows]
+    if preserve_audit:
+        archive_existing_gene_decisions(conn, trading_date, gene_id, decision_ids, review_ids)
     if review_ids:
         review_placeholders = ",".join("?" for _ in review_ids)
         conn.execute(f"DELETE FROM factor_review_items WHERE review_id IN ({review_placeholders})", review_ids)
@@ -243,9 +357,82 @@ def clear_existing_gene_decisions(conn: sqlite3.Connection, trading_date: str, g
         )
         conn.execute(f"DELETE FROM decision_reviews WHERE review_id IN ({review_placeholders})", review_ids)
     conn.execute(f"DELETE FROM review_logs WHERE decision_id IN ({placeholders})", decision_ids)
+    conn.execute(f"DELETE FROM pick_evaluations WHERE decision_id IN ({placeholders})", decision_ids)
     conn.execute(f"DELETE FROM outcomes WHERE decision_id IN ({placeholders})", decision_ids)
     conn.execute(f"DELETE FROM sim_orders WHERE decision_id IN ({placeholders})", decision_ids)
     conn.execute(f"DELETE FROM pick_decisions WHERE decision_id IN ({placeholders})", decision_ids)
+
+
+def archive_existing_gene_decisions(
+    conn: sqlite3.Connection,
+    trading_date: str,
+    gene_id: str,
+    decision_ids: list[str],
+    review_ids: list[str],
+) -> None:
+    if not decision_ids:
+        return
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pick_rerun_archives (
+          archive_id TEXT PRIMARY KEY,
+          trading_date TEXT NOT NULL,
+          strategy_gene_id TEXT NOT NULL,
+          decision_id TEXT,
+          artifact_type TEXT NOT NULL,
+          artifact_id TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          superseded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    decision_placeholders = ",".join("?" for _ in decision_ids)
+    specs: list[tuple[str, str, str, list[str]]] = [
+        ("pick_decision", "decision_id", f"SELECT * FROM pick_decisions WHERE decision_id IN ({decision_placeholders})", decision_ids),
+        ("sim_order", "order_id", f"SELECT * FROM sim_orders WHERE decision_id IN ({decision_placeholders})", decision_ids),
+        ("outcome", "outcome_id", f"SELECT * FROM outcomes WHERE decision_id IN ({decision_placeholders})", decision_ids),
+        ("review_log", "review_id", f"SELECT * FROM review_logs WHERE decision_id IN ({decision_placeholders})", decision_ids),
+        ("pick_evaluation", "evaluation_id", f"SELECT * FROM pick_evaluations WHERE decision_id IN ({decision_placeholders})", decision_ids),
+    ]
+    if review_ids:
+        review_placeholders = ",".join("?" for _ in review_ids)
+        specs.extend(
+            [
+                ("decision_review", "review_id", f"SELECT * FROM decision_reviews WHERE review_id IN ({review_placeholders})", review_ids),
+                ("factor_review_item", "item_id", f"SELECT * FROM factor_review_items WHERE review_id IN ({review_placeholders})", review_ids),
+                ("review_evidence", "evidence_id", f"SELECT * FROM review_evidence WHERE review_id IN ({review_placeholders})", review_ids),
+                ("review_error", "error_id", f"SELECT * FROM review_errors WHERE review_scope = 'decision' AND review_id IN ({review_placeholders})", review_ids),
+                ("optimization_signal", "signal_id", f"SELECT * FROM optimization_signals WHERE source_type = 'decision_review' AND source_id IN ({review_placeholders})", review_ids),
+            ]
+        )
+    for artifact_type, id_column, query, params in specs:
+        for row in conn.execute(query, params).fetchall():
+            payload = dict(row)
+            artifact_id = str(payload.get(id_column) or payload.get("rowid") or "")
+            decision_id = str(payload.get("decision_id") or "")
+            archive_id = hashlib.sha1(
+                f"{trading_date}:{gene_id}:{artifact_type}:{artifact_id}".encode("utf-8")
+            ).hexdigest()
+            conn.execute(
+                """
+                INSERT INTO pick_rerun_archives(
+                  archive_id, trading_date, strategy_gene_id, decision_id,
+                  artifact_type, artifact_id, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(archive_id) DO UPDATE SET
+                  payload_json = excluded.payload_json,
+                  superseded_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    f"archive_{archive_id[:16]}",
+                    trading_date,
+                    gene_id,
+                    decision_id or None,
+                    artifact_type,
+                    artifact_id,
+                    repository.dumps(payload),
+                ),
+            )
 
 
 def thesis_from_candidate(candidate: Candidate) -> dict[str, list[str]]:
@@ -284,10 +471,17 @@ def risks_from_candidate(candidate: Candidate) -> list[str]:
     return risks
 
 
-def generate_picks_for_all_genes(conn: sqlite3.Connection, trading_date: str) -> list[str]:
+def generate_picks_for_all_genes(
+    conn: sqlite3.Connection,
+    trading_date: str,
+    *,
+    preserve_audit: bool = False,
+) -> list[str]:
     decision_ids: list[str] = []
     for gene in repository.get_active_genes(conn):
-        decision_ids.extend(generate_picks_for_gene(conn, trading_date, gene["gene_id"]))
+        decision_ids.extend(
+            generate_picks_for_gene(conn, trading_date, gene["gene_id"], preserve_audit=preserve_audit)
+        )
     return decision_ids
 
 

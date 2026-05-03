@@ -65,6 +65,29 @@ from .stock_quant import build_stock_quant_report
 from .psychology_review import get_psychology_review, build_psychology_review, save_psychology_review
 from .next_day_plan import get_next_day_plan, build_next_day_plan, save_next_day_plan
 
+import logging as _logging
+_llm_logger = _logging.getLogger(__name__)
+
+
+def _llm_post_with_retry(url: str, headers: dict, json_body: dict, timeout: int = 30, max_retries: int = 2) -> dict | None:
+    """POST to LLM API with exponential backoff retry on transient errors."""
+    import httpx
+    import time
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = httpx.post(url, headers=headers, json=json_body, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                wait = 2 ** attempt * 3  # 3s, 6s
+                _llm_logger.warning("LLM API call failed (attempt %d/%d): %s, retrying in %ds", attempt + 1, max_retries + 1, e, wait)
+                time.sleep(wait)
+    _llm_logger.error("LLM API call failed after %d retries: %s", max_retries, last_err)
+    return None
+
 try:  # pragma: no cover - FastAPI is optional in the local test environment.
     from fastapi import FastAPI, Query
     from fastapi.middleware.cors import CORSMiddleware
@@ -74,7 +97,74 @@ except Exception:  # pragma: no cover
     CORSMiddleware = None  # type: ignore[assignment]
 
 
-DB_PATH = Path("var/stock_select.db")
+from .db import _DEFAULT_DB as _DEFAULT_DB_PATH
+DB_PATH = _DEFAULT_DB_PATH
+
+
+def _to_dict(obj: Any) -> dict[str, Any]:
+    if hasattr(obj, "__dict__"):
+        return {k: v for k, v in obj.__dict__.items() if not k.startswith("_")}
+    if isinstance(obj, dict):
+        return obj
+    return {}
+
+
+def _load_market_context(conn, trading_date: str, result: dict) -> None:
+    """Load market overview and sentiment cycle, generating if not available."""
+    try:
+        from .market_overview import get_market_overview, generate_market_overview
+        overview = get_market_overview(conn, trading_date)
+        if overview is None:
+            overview = generate_market_overview(conn, trading_date)
+        if overview:
+            from .market_overview import MarketOverview
+            result["market_overview"] = _to_dict(overview)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Failed to load market context for %s: %s", trading_date, e)
+
+    try:
+        from .sentiment_cycle import get_sentiment_cycle, generate_sentiment_cycle
+        cycle = get_sentiment_cycle(conn, trading_date)
+        if cycle is None:
+            cycle = generate_sentiment_cycle(conn, trading_date)
+        if cycle:
+            result["sentiment_cycle"] = _to_dict(cycle)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Failed to load sentiment cycle for %s: %s", trading_date, e)
+
+
+def _load_sector_quant(conn, stock_code: str, trading_date: str, result: dict) -> None:
+    """Load sector analysis and quantitative factors for a stock."""
+    try:
+        from .sector_analysis import get_sector_analysis, get_stock_sector_performance
+        sectors = get_sector_analysis(conn, trading_date)
+        if sectors:
+            result["sector_analysis"] = sectors
+        stock_sector = get_stock_sector_performance(conn, stock_code, trading_date)
+        if stock_sector:
+            result["stock_sector"] = stock_sector
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Failed to load sector data for %s: %s", stock_code, e)
+
+    try:
+        from .stock_quant import build_stock_quant_report
+        quant = build_stock_quant_report(conn, stock_code, trading_date)
+        if quant:
+            result["stock_quant"] = quant
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Failed to load quant data for %s: %s", stock_code, e)
+
+    try:
+        from .stock_quant import get_capital_flow_summary
+        capital = get_capital_flow_summary(conn, stock_code, trading_date)
+        if capital:
+            result["capital_flow"] = capital
+    except Exception:
+        pass
 
 
 def create_app(db_path: str | Path | None = None, mode: str = "demo"):
@@ -83,6 +173,11 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
 
     runtime = resolve_runtime(mode, db_path)
     app = FastAPI(title="Stock Select", version="0.1.0")
+
+    # Global broadcast manager for WebSocket alerts
+    class _BroadcastManagerHolder:
+        from .alert_service import BroadcastManager
+        manager = BroadcastManager()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -96,6 +191,22 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
         init_db(conn)
         seed_default_genes(conn)
         return conn
+
+    @app.on_event("startup")
+    def _startup():
+        """Auto-start scheduler with the correct runtime DB on server startup."""
+        import logging
+        logger = logging.getLogger(__name__)
+        try:
+            start_scheduler(runtime.db_path)
+            from .scheduler import _scheduler_instance as _sched
+            if _sched:
+                job_count = len(_sched.get_jobs())
+                logger.info("Scheduler auto-started with %d jobs (db=%s)", job_count, runtime.db_path)
+                print(f"Scheduler auto-started with {job_count} jobs")
+        except Exception as e:
+            logger.warning("Scheduler auto-start failed: %s", e)
+            print(f"Scheduler auto-start failed: {e}")
 
     @app.get("/api/dashboard")
     def dashboard(date: str | None = None) -> dict[str, Any]:
@@ -495,6 +606,30 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
         finally:
             conn.close()
 
+    @app.get("/api/genes/environment-performance")
+    def environment_performance(limit: int = 50, gene_id: str | None = None) -> dict[str, Any]:
+        conn = db()
+        try:
+            where = ""
+            params: tuple = ()
+            if gene_id:
+                where = "WHERE gene_id = ?"
+                params = (gene_id,)
+            rows = conn.execute(
+                f"""
+                SELECT gene_id, market_environment, period_start, period_end,
+                       trade_count, win_rate, avg_return, max_drawdown, alpha
+                FROM gene_environment_performance
+                {where}
+                ORDER BY period_end DESC, gene_id, market_environment
+                LIMIT ?
+                """,
+                (*params, limit),
+            )
+            return {"items": rows_to_dicts(rows)}
+        finally:
+            conn.close()
+
     @app.get("/api/genes/{gene_id}/performance")
     def gene_performance(gene_id: str) -> dict[str, Any]:
         conn = db()
@@ -572,21 +707,68 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
                          "查询市场概览、涨跌家数、情绪周期阶段",
                          request_data={"trading_date": date})
                 _attach_market_context(conn, result, date)
-                market_ok = result.get("market_overview") is not None
-                sentiment_ok = result.get("sentiment_cycle") is not None
+                market_data = result.get("market_overview")
+                sentiment_data = result.get("sentiment_cycle")
+                market_resp = {}
+                if market_data:
+                    market_resp = {k: market_data[k] for k in market_data if k in (
+                        "index_code", "index_name", "close_pct", "up_count", "down_count",
+                        "flat_count", "limit_up_count", "limit_down_count", "total_amount",
+                        "market_summary", "sh_return", "sz_return", "cyb_return", "bse_return",
+                        "advance_count", "decline_count")}
+                sentiment_resp = {}
+                if sentiment_data:
+                    sentiment_resp = {k: sentiment_data[k] for k in sentiment_data if k in (
+                        "phase", "phase_name", "up_limit_ratio", "down_limit_ratio",
+                        "consecutive_up_days", "consecutive_down_days", "yesterday_limit_up_premium",
+                        "summary")}
                 log_step(session_id, "市场环境加载完成",
-                         f"市场概览: {'有' if market_ok else '无'}, 情绪周期: {'有' if sentiment_ok else '无'}",
+                         f"市场概览: {'有' if market_resp else '无'}, 情绪周期: {'有' if sentiment_resp else '无'}",
                          completed=True,
-                         response_data={"market_overview": market_ok, "sentiment_cycle": sentiment_ok})
+                         response_data={**market_resp, **sentiment_resp} if (market_resp or sentiment_resp) else {"status": "无数据"})
                 log_step(session_id, "加载行业分析与量化因子",
                          "查询行业板块、连板形态、均线量价、资金流向",
                          request_data={"stock_code": stock_code})
                 _attach_stock_deep_review(conn, result, stock_code, date)
-                sq = {k: result.get(k) is not None for k in ["sector_analysis", "stock_quant", "capital_flow", "custom_sector_tags"]}
+                sector_resp = {}
+                sector_data = result.get("sector_analysis")
+                if sector_data:
+                    top = sector_data.get("top_sectors", [])[:3]
+                    sector_resp["top_sectors"] = [
+                        {k: s.get(k) for k in ("sector_name", "sector_code", "return_pct", "limit_up_count", "team_complete")}
+                        for s in top
+                    ]
+                stock_quant_data = result.get("stock_quant")
+                if stock_quant_data:
+                    stock_quant_resp = {
+                        "moving_average": stock_quant_data.get("moving_average"),
+                        "volume_analysis": stock_quant_data.get("volume_analysis"),
+                        "limit_up_chain": stock_quant_data.get("limit_up_chain"),
+                    }
+                else:
+                    stock_quant_resp = {"status": "无数据"}
+                capital_data = result.get("capital_flow")
+                capital_resp = {}
+                if capital_data:
+                    capital_resp = {k: capital_data[k] for k in capital_data if k in (
+                        "main_net_inflow", "super_large_net", "large_net", "medium_net",
+                        "small_net", "flow_direction", "summary")}
+                psychology_data = result.get("psychology_review")
+                psychology_resp = {}
+                if psychology_data:
+                    psychology_resp = {k: psychology_data[k] for k in psychology_data if k in (
+                        "verdict", "scenario", "plan", "summary")}
                 log_step(session_id, "行业量化加载完成",
-                         ", ".join(f"{k}: {'有' if v else '无'}" for k, v in sq.items()),
+                         ", ".join(f"{k}: {'有' if v and v.get('status') != '无数据' else '无'}"
+                                   for k, v in [("sector", sector_resp), ("quant", stock_quant_resp),
+                                                ("capital", capital_resp), ("psychology", psychology_resp)]),
                          completed=True,
-                         response_data=sq)
+                         response_data={
+                             "sector_analysis": sector_resp,
+                             "stock_quant": stock_quant_resp,
+                             "capital_flow": capital_resp,
+                             "psychology_review": psychology_resp,
+                         })
                 log_step(session_id, "生成 AI 解读", "调用大模型生成自然语言总结")
                 result["ai_summary"] = _generate_ai_summary(conn, result, stock_code, date)
                 log_step(session_id, "复盘完成", f"返回 {len(result)} 个字段", completed=True)
@@ -779,37 +961,34 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
             )
 
             if config.provider == "deepseek":
-                import httpx
                 model = config.model if hasattr(config, 'model') else "deepseek-chat"
-                resp = httpx.post(
+                data = _llm_post_with_retry(
                     "https://api.deepseek.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"},
                     json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 500},
-                    timeout=30,
                 )
-                data = resp.json()
+                if data is None:
+                    return None
                 return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or None
             elif config.provider == "anthropic":
-                import httpx
                 base_url = config.base_url or "https://api.anthropic.com"
-                resp = httpx.post(
+                data = _llm_post_with_retry(
                     f"{base_url}/v1/messages",
                     headers={"x-api-key": config.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
                     json={"model": config.model, "max_tokens": 500, "messages": [{"role": "user", "content": prompt}]},
-                    timeout=30,
                 )
-                data = resp.json()
+                if data is None:
+                    return None
                 return data.get("content", [{}])[0].get("text", "").strip() or None
             elif config.provider == "openai":
-                import httpx
                 base_url = config.base_url or "https://api.openai.com/v1"
-                resp = httpx.post(
+                data = _llm_post_with_retry(
                     f"{base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"},
                     json={"model": config.model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 500},
-                    timeout=30,
                 )
-                data = resp.json()
+                if data is None:
+                    return None
                 return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or None
         except Exception:
             return None
@@ -1266,7 +1445,7 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
     @app.post("/api/scheduler/start")
     def scheduler_start() -> dict[str, Any]:
         try:
-            start_scheduler(DB_PATH)
+            start_scheduler(runtime.db_path)
             return {"status": "ok", "message": "Scheduler started"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -1681,6 +1860,253 @@ def create_app(db_path: str | Path | None = None, mode: str = "demo"):
                 }
         finally:
             conn.close()
+
+    @app.get("/api/availability")
+    def availability_endpoint(date: str | None = None) -> dict[str, Any]:
+        from .data_availability import check_data_availability
+        conn = db()
+        try:
+            current_date = date or latest_trading_date(conn)
+            avail = check_data_availability(conn, current_date)
+            return {
+                "date": current_date,
+                "status": avail.status,
+                "price_coverage_pct": avail.price_coverage_pct,
+                "pick_count": avail.pick_count,
+                "event_source_count": avail.event_source_count,
+                "review_evidence_count": avail.review_evidence_count,
+                "reasons": avail.reasons,
+            }
+        finally:
+            conn.close()
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/api/reviews/custom-sectors/{stock_code}")
+    def custom_sector_tags_endpoint(stock_code: str, date: str | None = None, trading_date: str | None = None) -> dict[str, Any]:
+        conn = db()
+        try:
+            from .stock_classifier import get_custom_sector_tags, SECTOR_DISPLAY_NAMES
+            d = date or trading_date or latest_trading_date(conn)
+            tags = get_custom_sector_tags(conn, stock_code, d)
+            return {
+                "tags": [
+                    {"key": t, "display": SECTOR_DISPLAY_NAMES.get(t, t)}
+                    for t in tags
+                ],
+            }
+        finally:
+            conn.close()
+
+    # ──────────────────────────────────────────────
+    # Announcement Hunter endpoints
+    # ──────────────────────────────────────────────
+
+    @app.get("/api/announcements/alerts")
+    def announcement_alerts(
+        date: str | None = None,
+        status: str | None = None,
+        alert_type: str | None = None,
+        stock_code: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        conn = db()
+        try:
+            query = "SELECT * FROM announcement_alerts WHERE 1=1"
+            params: list = []
+            if date:
+                query += " AND trading_date=?"
+                params.append(date)
+            if status:
+                query += " AND status=?"
+                params.append(status)
+            if alert_type:
+                query += " AND alert_type=?"
+                params.append(alert_type)
+            if stock_code:
+                query += " AND stock_code=?"
+                params.append(stock_code)
+            query += " ORDER BY discovered_at DESC LIMIT ?"
+            params.append(limit)
+            return rows_to_dicts(conn.execute(query, params))
+        finally:
+            conn.close()
+
+    @app.get("/api/announcements/alerts/{alert_id}")
+    def announcement_alert_detail(alert_id: str) -> dict[str, Any] | None:
+        conn = db()
+        try:
+            row = conn.execute(
+                "SELECT * FROM announcement_alerts WHERE alert_id=?",
+                (alert_id,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    @app.post("/api/announcements/alerts/{alert_id}/acknowledge")
+    def announcement_alert_acknowledge(alert_id: str) -> dict[str, Any]:
+        conn = db()
+        try:
+            conn.execute(
+                "UPDATE announcement_alerts SET status='acknowledged' WHERE alert_id=?",
+                (alert_id,),
+            )
+            conn.commit()
+            return {"status": "ok", "alert_id": alert_id}
+        finally:
+            conn.close()
+
+    @app.post("/api/announcements/alerts/{alert_id}/dismiss")
+    def announcement_alert_dismiss(alert_id: str) -> dict[str, Any]:
+        conn = db()
+        try:
+            conn.execute(
+                "UPDATE announcement_alerts SET status='dismissed' WHERE alert_id=?",
+                (alert_id,),
+            )
+            conn.commit()
+            return {"status": "ok", "alert_id": alert_id}
+        finally:
+            conn.close()
+
+    @app.get("/api/announcements/monitor-runs")
+    def announcement_monitor_runs(limit: int = 20) -> list[dict[str, Any]]:
+        conn = db()
+        try:
+            return rows_to_dicts(
+                conn.execute(
+                    "SELECT * FROM monitor_runs ORDER BY started_at DESC LIMIT ?",
+                    (limit,),
+                )
+            )
+        finally:
+            conn.close()
+
+    @app.get("/api/announcements/sector-heat")
+    def announcement_sector_heat(date: str | None = None) -> list[dict[str, Any]]:
+        conn = db()
+        try:
+            d = date or latest_trading_date(conn)
+            if not d:
+                return []
+            return rows_to_dicts(
+                conn.execute(
+                    "SELECT * FROM sector_heat_index WHERE trading_date=? ORDER BY heat_score DESC",
+                    (d,),
+                )
+            )
+        finally:
+            conn.close()
+
+    @app.get("/api/announcements/live-stats")
+    def announcement_live_stats(date: str | None = None) -> dict[str, Any]:
+        conn = db()
+        try:
+            d = date
+            if not d:
+                # Prefer announcement_alerts date range, fall back to daily_prices
+                row = conn.execute("SELECT MAX(trading_date) AS date FROM announcement_alerts").fetchone()
+                d = row["date"] if row and row["date"] else None
+            if not d:
+                d = latest_trading_date(conn)
+            if not d:
+                return {"date": None, "total": 0, "by_type": {}, "max_score": 0, "new_count": 0}
+
+            total = conn.execute(
+                "SELECT COUNT(*) FROM announcement_alerts WHERE trading_date=?", (d,)
+            ).fetchone()[0]
+
+            by_type = {}
+            for row in conn.execute(
+                "SELECT alert_type, COUNT(*) as cnt FROM announcement_alerts WHERE trading_date=? GROUP BY alert_type",
+                (d,),
+            ):
+                by_type[row["alert_type"]] = row["cnt"]
+
+            max_score_row = conn.execute(
+                "SELECT MAX(sentiment_score) as mx FROM announcement_alerts WHERE trading_date=?", (d,)
+            ).fetchone()
+            max_score = max_score_row["mx"] or 0
+
+            new_count = conn.execute(
+                "SELECT COUNT(*) FROM announcement_alerts WHERE trading_date=? AND status='new'", (d,)
+            ).fetchone()[0]
+
+            return {
+                "date": d,
+                "total": total,
+                "by_type": by_type,
+                "max_score": round(max_score, 3),
+                "new_count": new_count,
+            }
+        finally:
+            conn.close()
+
+    @app.post("/api/announcements/scan/trigger")
+    def announcement_scan_trigger() -> dict[str, Any]:
+        """Manual one-shot scan — always works, independent of cron."""
+        from .announcement_monitor import run_announcement_scan
+        conn = db()
+        try:
+            init_db(conn)
+            alerts = run_announcement_scan(conn)
+            return {"success": True, "alerts_found": len(alerts)}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+        finally:
+            conn.close()
+
+    @app.post("/api/announcements/scan/pause")
+    def announcement_scan_pause() -> dict[str, Any]:
+        """Pause the cron-driven auto-scan."""
+        from .scheduler import pause_announcement_scan
+        ok = pause_announcement_scan()
+        return {"success": ok, "message": "自动扫描已暂停" if ok else "调度器未运行"}
+
+    @app.post("/api/announcements/scan/resume")
+    def announcement_scan_resume() -> dict[str, Any]:
+        """Resume the cron-driven auto-scan."""
+        from .scheduler import resume_announcement_scan
+        ok = resume_announcement_scan()
+        return {"success": ok, "message": "自动扫描已恢复" if ok else "调度器未运行"}
+
+    @app.get("/api/announcements/scan/status")
+    def announcement_scan_status() -> dict[str, Any]:
+        from .scheduler import is_scan_paused, get_scheduler_status
+        sched = get_scheduler_status()
+        auto_paused = is_scan_paused() if sched["running"] else None
+        return {
+            "scheduler_running": sched["running"],
+            "auto_paused": auto_paused,
+        }
+
+    @app.get("/api/announcements/events")
+    def announcement_scan_events(limit: int = 50) -> list[dict[str, Any]]:
+        from .announcement_monitor import get_scan_events
+        conn = db()
+        try:
+            return get_scan_events(limit, conn=conn)
+        finally:
+            conn.close()
+
+    # WebSocket endpoint for real-time alerts
+    broadcast_manager = _BroadcastManagerHolder()
+
+    @app.websocket("/ws/alerts")
+    async def websocket_alerts(ws):
+        await ws.accept()
+        client_id = await broadcast_manager.manager.register(ws)
+        try:
+            while True:
+                # Keep connection alive — client can send ping
+                await ws.receive_text()
+        except Exception:
+            pass
+        finally:
+            await broadcast_manager.manager.unregister(ws)
 
     return app
 

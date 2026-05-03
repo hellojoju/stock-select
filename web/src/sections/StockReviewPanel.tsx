@@ -1,9 +1,9 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { BrainCircuit, X, ChevronDown, ChevronRight, TrendingUp, TrendingDown, ArrowUpRight, ArrowDownRight } from 'lucide-react';
+import { API_BASE } from '../api/client';
 import { formatPct } from '../lib/format';
+import ReviewHistoryPanel from '../components/ReviewHistoryPanel';
 import type { FactorItem, ReviewDecision, ReviewEvidence, ReviewSignal } from '../types';
-
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:18425';
 const VISIBILITY_LABEL: Record<string, string> = { PREOPEN_VISIBLE: '盘前可见', POSTCLOSE_OBSERVED: '收盘可见', POSTDECISION_EVENT: '事后事件' };
 const FACTOR_LABEL: Record<string, string> = { technical: '技术面', fundamental: '基本面', event: '事件面', sector: '行业面', risk: '风险面', execution: '执行', earnings_surprise: '预期差', order_contract: '订单合同', business_kpi: '经营 KPI', risk_event: '风险事件', expectation: '市场预期' };
 const GENE_LABEL: Record<string, string> = { gene_hypothetical: '假设性分析' };
@@ -28,6 +28,13 @@ function confidenceLabel(c: string): string {
   if (c === 'EXTRACTED' || c === '提取') return '提取';
   if (c === 'INFERRED' || c === '推断') return '推断';
   return c;
+}
+
+/** 安全取贡献分，兼容后端返回 string/null/undefined/NaN */
+function safeScore(v: unknown): number {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
+  if (typeof v === 'string') { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+  return 0;
 }
 
 interface ReviewSummary {
@@ -56,7 +63,15 @@ interface LlmReviewJson {
   };
 }
 
-export default function StockReviewPanel({ data }: { data?: Record<string, unknown> | null }) {
+export default function StockReviewPanel({
+  data,
+  date,
+  onReviewStock,
+}: {
+  data?: Record<string, unknown> | null;
+  date?: string;
+  onReviewStock?: (code: string, reviewDate: string) => void;
+}) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [signalStatus, setSignalStatus] = useState<Record<string, string>>({});
   const [expandedFactor, setExpandedFactor] = useState<number | null>(null);
@@ -64,6 +79,9 @@ export default function StockReviewPanel({ data }: { data?: Record<string, unkno
   const [aiLoading, setAiLoading] = useState(false);
   const [aiSummary, setAiSummary] = useState<string | null>(data?.ai_summary as string | null ?? null);
   const [expandedCard, setExpandedCard] = useState<string | null>(null);
+
+  // 切换股票时重置展开状态
+  useEffect(() => { setExpandedFactor(null); }, [data?.stock_code ?? data?.trading_date]);
 
   if (!data) return <p className="memory">点击推荐列表中的股票查看单股复盘。</p>;
 
@@ -77,6 +95,25 @@ export default function StockReviewPanel({ data }: { data?: Record<string, unkno
     : null;
   const relatedDocs = data.related_documents ? (data.related_documents as Array<Record<string, unknown>>) : null;
   const isHypo = data.hypothetical === true;
+  const dataInsufficient = data.data_insufficient === true;
+
+  // 数据不足时显示友好提示
+  if (dataInsufficient && !decisions.length) {
+    return (
+      <div className="review-detail">
+        <div className="stock-header">
+          <div className="stock-title-row">
+            <h3>{String(stock.stock_code ?? '')}{stock.name && String(stock.name) !== String(stock.stock_code) ? ` ${String(stock.name)}` : ''}</h3>
+          </div>
+        </div>
+        <div className="hypothetical-notice">
+          <span className="hypothetical-icon">⚠</span>
+          <span>{String(data.data_insufficient_reason ?? '该股票当日数据不足，无法进行复盘分析')}</span>
+        </div>
+        <p className="empty-state">可能原因：股票当日停牌、数据未入库、或非交易日。请尝试其他日期或股票。</p>
+      </div>
+    );
+  }
 
   // Extract deep review data
   const marketOverview = data.market_overview as Record<string, unknown> | undefined;
@@ -297,13 +334,16 @@ export default function StockReviewPanel({ data }: { data?: Record<string, unkno
                 {decision.factor_items?.length > 0 && (
                   <section className="detail-section">
                     <h4>多维分析</h4>
+                    <div className="score-hint">贡献分：<span className="positive">正分</span>表示该维度支撑利好，<span className="negative">负分</span>表示支撑利空，绝对值越大影响越大</div>
                     <table className="detail-table factor-table clickable">
-                      <thead><tr><th>维度</th><th>判决</th><th title="正分=该维度支持利好结论，负分=支持利空结论。绝对值越大，对最终判决影响越大">贡献分 ⓘ</th><th>置信度</th></tr></thead>
+                      <thead><tr><th>维度</th><th>判决</th><th title="正分=该维度支持利好结论，负分=支持利空结论。绝对值越大，对最终判决影响越大">贡献分</th><th>置信度</th></tr></thead>
                       <tbody>
-                        {decision.factor_items.map((f, i) => (
+                        {decision.factor_items.map((f, i) => {
+                          const score = safeScore(f.contribution_score);
+                          return (
                           <tr
                             key={i}
-                            className={`factor-row ${expandedFactor === i ? 'expanded' : ''} ${f.contribution_score !== 0 ? 'has-signal' : ''}`}
+                            className={`factor-row ${expandedFactor === i ? 'expanded' : ''} ${score !== 0 ? 'has-signal' : ''}`}
                             onClick={() => setExpandedFactor(expandedFactor === i ? null : i)}
                           >
                             <td>
@@ -311,10 +351,11 @@ export default function StockReviewPanel({ data }: { data?: Record<string, unkno
                               <span className="factor-expand-icon">{expandedFactor === i ? '▾' : '▸'}</span>
                             </td>
                             <td><span className={`verdict-badge verdict-${f.verdict}`}>{verdictLabel(String(f.verdict))}</span></td>
-                            <td><span className={f.contribution_score > 0 ? 'positive' : f.contribution_score < 0 ? 'negative' : ''}>{f.contribution_score > 0 ? '+' : ''}{f.contribution_score.toFixed(2)}</span></td>
+                            <td><span className={score > 0 ? 'positive' : score < 0 ? 'negative' : ''}>{score > 0 ? '+' : ''}{score.toFixed(2)}</span></td>
                             <td><span className={`conf-badge conf-${f.confidence}`}>{confidenceLabel(String(f.confidence))}</span></td>
                           </tr>
-                        ))}
+                          );
+                        })}
                       </tbody>
                     </table>
                     {/* 展开显示解释和数据 */}
@@ -401,6 +442,13 @@ export default function StockReviewPanel({ data }: { data?: Record<string, unkno
       })}
 
       <EvidenceFacts facts={facts} />
+
+      {date && onReviewStock && (
+        <div style={{ marginTop: 16 }}>
+          <h4 style={{ marginBottom: 8 }}>复盘历史</h4>
+          <ReviewHistoryPanel date={date} onReviewStock={onReviewStock} />
+        </div>
+      )}
 
       {/* AI Summary Modal */}
       {aiOpen && (
@@ -660,7 +708,8 @@ function FactorExplanation({ factor }: { factor: FactorItem }) {
   }
 
   const hasScore = factor.expected && typeof factor.expected.score === 'number';
-  const rawScore = hasScore ? (factor.expected!.score as number) : factor.contribution_score;
+  const rawScore = hasScore ? (factor.expected!.score as number) : safeScore(factor.contribution_score);
+  const contribScore = safeScore(factor.contribution_score);
 
   return (
     <div className="factor-explanation-card">
@@ -668,10 +717,10 @@ function FactorExplanation({ factor }: { factor: FactorItem }) {
       <div className="factor-explanation-header">
         <h5>{label}</h5>
         <div className="factor-score-breakdown">
-          {hasScore && (
+          {hasScore && typeof rawScore === 'number' && (
             <span className="score-chip">原始评分: {rawScore > 0 ? '+' : ''}{rawScore.toFixed(4)}</span>
           )}
-          <span className="score-chip">贡献分: {factor.contribution_score > 0 ? '+' : ''}{factor.contribution_score.toFixed(2)}</span>
+          <span className="score-chip">贡献分: {contribScore > 0 ? '+' : ''}{contribScore.toFixed(2)}</span>
           <span className={`score-chip verdict-${factor.verdict}`}>判决: {verdictLabel(String(factor.verdict))}</span>
         </div>
       </div>

@@ -1,0 +1,4 @@
+{"payload": {"phase": "sync_data", "trading_date": "2024-01-15"}, "type": "init"}
+{"payload": {"rows": 5}, "type": "done"}
+{"payload": {"phase": "sync_data", "trading_date": "2024-01-15"}, "type": "init"}
+{"payload": {"rows": 5}, "type": "done"}

@@ -10,3 +10,4 @@ var/*.db-wal
 var/scratchpads/
 web/node_modules/
 web/dist/
+.env

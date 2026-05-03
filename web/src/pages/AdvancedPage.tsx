@@ -2,10 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Save, Server, Zap } from 'lucide-react';
 import Panel from '../components/Panel';
 import { PageHeader } from '../components/PageHeader';
-import { fetchConfig, updateModel, fetchRuns, runPhase, fetchSystemStatus } from '../api/client';
+import { API_BASE, fetchConfig, updateModel, fetchRuns, runPhase, fetchSystemStatus } from '../api/client';
 import type { ModelConfig } from '../api/client';
-
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:18425';
 
 const PHASES = ['sync_data', 'preopen_pick', 'simulate', 'deterministic_review', 'llm_review', 'evolve'];
 const PHASE_LABELS: Record<string, string> = {
@@ -43,7 +41,7 @@ export default function AdvancedPage() {
   async function loadSystemInfo(targetDate: string) {
     try {
       const data = await fetchSystemStatus(targetDate);
-      setSystemInfo(data);
+      setSystemInfo(data && typeof data === 'object' ? data as Record<string, unknown> : null);
     } catch { setSystemInfo(null); }
   }
 

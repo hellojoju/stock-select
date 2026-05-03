@@ -15,8 +15,8 @@ def plan_preopen_focus(conn: sqlite3.Connection, trading_date: str) -> dict[str,
         SELECT industry, sector_return_pct, relative_strength_rank,
                theme_strength, catalyst_count
         FROM sector_theme_signals
-        WHERE trading_date = ?
-        ORDER BY sector_return_pct DESC
+        WHERE trading_date < ?
+        ORDER BY trading_date DESC, sector_return_pct DESC
         LIMIT 5
         """,
         (trading_date,),

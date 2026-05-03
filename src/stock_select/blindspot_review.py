@@ -180,6 +180,33 @@ def evidence_reasons_for_blindspot(conn: sqlite3.Connection, stock_code: str, tr
                 }
             )
             break
+
+    # S5.3: Check for pre-open news/announcements that were missed
+    try:
+        preopen_docs = conn.execute(
+            """
+            SELECT r.document_id, r.source, r.source_type, r.title, r.published_at
+            FROM document_stock_links dsl
+            JOIN raw_documents r ON r.document_id = dsl.document_id
+            WHERE dsl.stock_code = ?
+              AND (r.published_at < ? OR r.published_at IS NULL)
+            ORDER BY r.published_at DESC
+            LIMIT 5
+            """,
+            (stock_code, trading_date),
+        ).fetchall()
+        for doc in preopen_docs:
+            reasons.append(
+                {
+                    "error_type": "missed_news_announcement",
+                    "source_type": f"news:{doc['source_type']}",
+                    "source_id": doc["document_id"],
+                    "confidence": 0.75,
+                }
+            )
+    except Exception:
+        pass  # document_stock_links table may not exist yet
+
     return reasons
 
 

@@ -41,7 +41,8 @@ class TestPlanPreopenFocus:
         os.environ.pop("ANTHROPIC_API_KEY", None)
         os.environ.pop("CLAUDE_API_KEY", None)
 
-        plan = plan_preopen_focus(demo_db, "2026-01-12")
+        # Seed data uses 2026-01-12, so query for 2026-01-13 to find < 2026-01-13
+        plan = plan_preopen_focus(demo_db, "2026-01-13")
         industries = [s["industry"] for s in plan["focus_sectors"]]
         assert "Battery" in industries
         assert "Food" in industries
@@ -62,6 +63,7 @@ class TestPlanPreopenFocus:
         os.environ.pop("ANTHROPIC_API_KEY", None)
         os.environ.pop("CLAUDE_API_KEY", None)
 
-        plan = plan_preopen_focus(demo_db, "2099-01-01")
-        assert plan["trading_date"] == "2099-01-01"
+        # 2026-01-10 is before all seed data (2026-01-12), so no historical sectors
+        plan = plan_preopen_focus(demo_db, "2026-01-10")
+        assert plan["trading_date"] == "2026-01-10"
         assert plan["focus_sectors"] == []

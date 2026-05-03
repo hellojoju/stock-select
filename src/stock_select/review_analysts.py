@@ -64,8 +64,17 @@ def ANALYST_REVIEWS_TABLE() -> str:
     """
 
 
-def run_analyst_reviews(conn: sqlite3.Connection, trading_date: str) -> list[dict[str, Any]]:
-    """Run all registered analyst reviews for a given trading date."""
+def run_analyst_reviews(
+    conn: sqlite3.Connection,
+    trading_date: str,
+    *,
+    include_llm: bool = True,
+) -> list[dict[str, Any]]:
+    """Run registered analyst reviews for a given trading date.
+
+    Deterministic review callers should pass ``include_llm=False`` so this
+    function never performs an external LLM call as a side effect.
+    """
     conn.executescript(ANALYST_REVIEWS_TABLE())
 
     decision_rows = conn.execute(
@@ -87,6 +96,8 @@ def run_analyst_reviews(conn: sqlite3.Connection, trading_date: str) -> list[dic
         evidence = load_analyst_evidence(conn, row["stock_code"], row["trading_date"])
 
         for analyst_key, config in REVIEW_ANALYSTS.items():
+            if config.get("use_llm") and not include_llm:
+                continue
             try:
                 verdict = config["analyst_func"](conn, decision_id, row, evidence)
                 persist_analyst_verdict(conn, verdict, row)

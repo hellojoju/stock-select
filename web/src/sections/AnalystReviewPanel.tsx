@@ -31,14 +31,15 @@ function AnalystLabel({ analystKey }: { analystKey: string }) {
 
 export default function AnalystReviewPanel({ reviews }: { reviews: AnalystReview[] }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const safeReviews = Array.isArray(reviews) ? reviews : [];
 
-  if (!reviews || reviews.length === 0) {
+  if (safeReviews.length === 0) {
     return <div className="empty-state">暂无分析师评审结果</div>;
   }
 
   // Group by analyst_key
   const grouped: Record<string, AnalystReview[]> = {};
-  for (const r of reviews) {
+  for (const r of safeReviews) {
     if (!grouped[r.analyst_key]) grouped[r.analyst_key] = [];
     grouped[r.analyst_key].push(r);
   }
@@ -55,7 +56,7 @@ export default function AnalystReviewPanel({ reviews }: { reviews: AnalystReview
         const items = grouped[key] ?? [];
         if (items.length === 0) return null;
         const isCollapsed = collapsed[key];
-        const avgConf = items.reduce((s, r) => s + r.confidence, 0) / items.length;
+        const avgConf = items.reduce((s, r) => s + Number(r.confidence ?? 0), 0) / items.length;
         const agreeRate = items.filter((r) => r.verdict === 'AGREE').length / items.length;
 
         return (
@@ -77,14 +78,14 @@ export default function AnalystReviewPanel({ reviews }: { reviews: AnalystReview
                     <div className="analyst-item-header">
                       <strong>{r.stock_name ?? r.stock_code}</strong>
                       <VerdictBadge verdict={r.verdict} />
-                      <span className="confidence-num">{r.confidence.toFixed(2)}</span>
+                      <span className="confidence-num">{Number(r.confidence ?? 0).toFixed(2)}</span>
                     </div>
                     <ul className="analyst-reasoning">
-                      {r.reasoning.map((reason, i) => (
+                      {(Array.isArray(r.reasoning) ? r.reasoning : []).map((reason, i) => (
                         <li key={i}>{reason}</li>
                       ))}
                     </ul>
-                    {r.suggested_errors.length > 0 && (
+                    {Array.isArray(r.suggested_errors) && r.suggested_errors.length > 0 && (
                       <div className="analyst-errors">
                         {r.suggested_errors.map((e, i) => (
                           <span key={i} className="error-chip">{e}</span>

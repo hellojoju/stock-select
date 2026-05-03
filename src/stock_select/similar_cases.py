@@ -32,7 +32,7 @@ def find_similar_cases(
 
     # market_environment: filter via trading_days if available
     if market_environment and market_environment != "all":
-        conditions.append("trading_date IN (SELECT trading_date FROM market_environments WHERE environment = ?)")
+        conditions.append("trading_date IN (SELECT trading_date FROM trading_days WHERE market_environment = ?)")
         params.append(market_environment)
 
     query = "SELECT * FROM decision_reviews WHERE 1=1"
