@@ -22,23 +22,30 @@ A-share stock selection system with self-evolving strategy genes. Daily automate
 
 ```bash
 # Demo mode (no API keys needed)
-uv run stock-select serve --demo
+uv run stock-select serve --mode demo --port 18425
 
 # Live mode
 cp .env.example .env  # edit with API keys
-uv run stock-select serve
+uv run stock-select serve --mode live
 ```
+
+Backend: http://localhost:18425
+Frontend: http://localhost:5173
 
 ## CLI Commands
 
 | Command | Description |
 |---------|-------------|
-| `stock-select serve` | Start web server + scheduler |
-| `stock-select serve --demo` | Demo mode with seeded data |
-| `stock-select pipeline` | Run full daily pipeline once |
-| `stock-select pipeline --demo` | Pipeline in demo mode |
-| `stock-select sync` | Sync data only |
-| `stock-select status` | Show system status |
+| `uv run stock-select serve --mode demo` | Start web server + scheduler |
+| `uv run stock-select pipeline --date YYYY-MM-DD` | Run full daily pipeline once |
+| `uv run stock-select run-daily --date YYYY-MM-DD` | Picks + simulate (no data sync) |
+| `uv run stock-select run-phase <phase> --date YYYY-MM-DD` | Run a named pipeline phase |
+| `uv run stock-select init-db` | Initialize database schema |
+| `uv run stock-select seed-demo` | Seed demo data |
+| `uv run stock-select performance` | Show strategy performance |
+| `uv run stock-select memory-search --q <keyword>` | Search FTS5 memory |
+
+All commands support `--mode demo` or `--mode live`.
 
 ## Environment Variables
 
@@ -60,7 +67,8 @@ pytest tests/ -q
 
 ## Architecture Notes
 
-- Backend unified on FastAPI (`api.py`); `server.py` retained for backward compatibility
+- Backend defaults to stdlib HTTPServer (`server.py`); auto-upgrades to FastAPI if uvicorn is installed
 - Pipeline orchestrated via `run_phase()` in `agent_runtime.py`
 - Strategy evolution: challenger → observing → promotion/rollback lifecycle
 - Deterministic review uses fixed rules; LLM review uses Claude/DeepSeek
+- Scheduler jobs run Mon-Fri 7:00-16:00 for trading workflow, Sat 10:00 for gene evolution

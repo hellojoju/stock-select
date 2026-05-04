@@ -58,13 +58,18 @@ curl http://127.0.0.1:18425/api/scheduler/status
 
 | 时间 | 阶段 |
 |------|------|
-| 周一~周五 08:00 | 数据同步 |
-| 周一~周五 08:10 | 预盘选股 |
-| 周一~周五 09:25 | 模拟开盘 |
+| 周一~周五 07:00 | 数据同步 |
+| 周一~周五 07:15 | 市场概览 |
+| 周一~周五 07:20 | 因子同步 |
+| 周一~周五 07:50 | 预盘选股 |
+| 周一~周五 09:30 | 模拟开盘 |
 | 周一~周五 15:05 | 收盘数据同步 |
-| 周一~周五 15:15 | 确定性复盘 |
-| 周一~周五 15:30 | LLM 复盘 |
+| 周一~周五 15:15 | 收盘因子同步 |
+| 周一~周五 15:30 | 确定性复盘 |
+| 周一~周五 15:45 | LLM 复盘 |
+| 周一~周五 16:00 | 证据同步 |
 | 周六 10:00 | 策略进化 |
+| 周六 11:00 | 环境绩效统计 |
 
 ### Smoke 测试
 
@@ -107,19 +112,19 @@ curl http://127.0.0.1:18425/api/genes
 ### 提出进化候选
 
 ```bash
-.venv/bin/python -m stock_select.cli propose-evolution --period 2024-04-01,2024-04-30
+.venv/bin/python -m stock_select.cli propose-evolution --start 2024-04-01 --end 2024-04-30
 ```
 
 ### 推广 Challenger
 
 ```bash
-.venv/bin/python -m stock_select.cli promote-challenger --challenger-id <gene_id>
+.venv/bin/python -m stock_select.cli promote-challenger --child-gene-id <gene_id> --event-id <event_id>
 ```
 
 ### 回滚
 
 ```bash
-.venv/bin/python -m stock_select.cli rollback-evolution --challenger-id <gene_id>
+.venv/bin/python -m stock_select.cli rollback-evolution --child-gene-id <gene_id>
 ```
 
 ## 知识库
@@ -133,7 +138,7 @@ curl http://127.0.0.1:18425/api/genes
 ### 处理 PDF 公告
 
 ```bash
-.venv/bin/python -m stock_select.cli process-pdfs --date 2024-04-22
+.venv/bin/python -m stock_select.cli process-pdfs --date 2024-04-22 --limit 20
 ```
 
 ### 查询文档
@@ -166,8 +171,8 @@ curl http://127.0.0.1:18425/api/graph/stocks/000001/neighborhood?date=2024-04-22
 ### 导出 Graphify
 
 ```bash
-.venv/bin/python -m stock_select.cli export-graphify
-# 输出: graphify-out/graph.json
+.venv/bin/python -m stock_select.cli export-graphify --date 2024-04-22
+# 输出: var/graphify/graph.json
 ```
 
 ## 排障
