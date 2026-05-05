@@ -559,6 +559,7 @@ h1 {
 .panel {
   padding: 14px;
   min-width: 0;
+  overflow: auto;
 }
 
 .panel h2 {
@@ -843,10 +844,14 @@ h1 {
 
 .filter-stack,
 .stack,
-.review-detail,
-.audit-actions,
+.review-detail {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
 .data-layer-list,
 .quick-detail,
+.audit-actions,
 .dry-run-preview {
   display: grid;
   gap: 12px;
@@ -1237,9 +1242,16 @@ button.decision-tile {
 .event-item {
   display: grid;
   gap: 4px;
+  min-width: 0;
 }
-
+.event-item strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .event-item span {
+  overflow-wrap: break-word;
+  word-break: break-word;
   color: var(--muted);
 }
 
@@ -2142,6 +2154,17 @@ button.decision-tile {
   font-size: 12px;
 }
 
+.evolution-layout .terminal-table,
+.ops-layout .terminal-table {
+  overflow-x: auto;
+}
+.evolution-layout .terminal-thead,
+.evolution-layout .terminal-row,
+.ops-layout .terminal-thead,
+.ops-layout .terminal-row {
+  min-width: unset;
+}
+
 @media (max-width: 1280px) {
   .research-layout,
   .review-workspace,
@@ -2355,15 +2378,20 @@ button.decision-tile {
   border-radius: var(--radius-sm);
   margin-bottom: var(--space-md);
   font-size: var(--text-sm);
+  overflow-wrap: break-word;
+  word-break: break-word;
+  line-height: 1.5;
 }
 .planner-alignment .terminal-table {
   width: 100%;
+  overflow-x: hidden;
 }
 .planner-alignment .terminal-table-header,
 .planner-alignment .terminal-table-row {
   display: flex;
   padding: var(--space-xs) var(--space-sm);
   border-bottom: 1px solid var(--color-border-subtle);
+  min-width: unset;
 }
 .planner-alignment .terminal-table-header {
   font-weight: 600;
@@ -2374,6 +2402,13 @@ button.decision-tile {
 .planner-alignment .col {
   flex: 1;
   font-size: var(--text-sm);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.planner-alignment .col:first-child {
+  white-space: normal;
 }
 
 /* Challenger Performance */
@@ -2414,6 +2449,7 @@ button.decision-tile {
 }
 .challenger-perf .card-stats {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-md);
   font-size: var(--text-sm);
   color: var(--color-text-muted);
@@ -2605,8 +2641,14 @@ button.decision-tile {
   gap: var(--space-xs);
   align-items: center;
   font-size: var(--text-sm);
+  min-width: 0;
 }
-.factor-edge-label { font-weight: 600; }
+.factor-edge-label {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .factor-edge-bar-track {
   height: 6px;
   background: var(--surface-muted);
@@ -2637,6 +2679,12 @@ button.decision-tile {
   flex-direction: column;
   gap: 4px;
   font-size: var(--text-xs);
+  min-width: 0;
+}
+.evidence-coverage-item > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .coverage-bar-track {
   height: 4px;
@@ -2668,6 +2716,10 @@ button.decision-tile {
 .top-error-type {
   font-weight: 600;
   flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .top-error-count { color: var(--muted); }
 .top-error-severity { color: var(--amber); font-weight: 600; }
@@ -3606,6 +3658,7 @@ button.decision-tile {
   border-radius: 6px;
   background: rgba(15, 23, 42, 0.3);
   gap: 12px;
+  min-width: 0;
 }
 
 .review-history-item.clickable {
@@ -3645,6 +3698,10 @@ button.decision-tile {
 .review-history-industry {
   color: var(--color-text-muted);
   font-size: 12px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .review-history-action-badge {
